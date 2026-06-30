@@ -1,0 +1,14 @@
+Hyperscanning summary  2026-06-26T09:31:00.577972
+  A: recordings/20260626_092359_Muse.csv
+  B: recordings/20260626_092800_Muse.csv
+  fs=256 Hz, epochs=13, epoch_len=2.0s
+
+  theta  ( 4.0- 8.0 Hz): mean PLV = 0.290  max = 0.368
+  theta  ( 4.0- 8.0 Hz): mean circ-r = 0.027  min = -0.117  max = 0.100
+     significant pairs (p<0.05): 0/16
+  alpha  ( 8.0-13.0 Hz): mean PLV = 0.236  max = 0.283
+  alpha  ( 8.0-13.0 Hz): mean circ-r = 0.021  min = -0.064  max = 0.100
+     significant pairs (p<0.05): 0/16
+  beta   (13.0-30.0 Hz): mean PLV = 0.170  max = 0.314
+  beta   (13.0-30.0 Hz): mean circ-r = -0.025  min = -0.116  max = 0.072
+     significant pairs (p<0.05): 1/16
