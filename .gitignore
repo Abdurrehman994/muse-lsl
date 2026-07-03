@@ -1,7 +1,7 @@
 *.pyc
 #*.csv
 .ipynb_checkpoints
-recordings/
+recordings/*.csv
 out/
 *.log
 
