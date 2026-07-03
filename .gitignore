@@ -1,6 +1,9 @@
 *.pyc
 #*.csv
 .ipynb_checkpoints
+recordings/
+out/
+*.log
 
 build/
 dist/

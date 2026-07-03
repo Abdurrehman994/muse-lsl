@@ -1,4 +1,5 @@
 """
+ICA
 record_both.py — record TWO simultaneous Muse EEG streams for hyperscanning.
 
 Both headsets must be streaming via muselsl BEFORE running this script:
@@ -69,12 +70,15 @@ def find_eeg_streams(wait_time=5):
     return streams
 
 
-def pick_stream(streams, name):
-    """Return the first stream whose name or source_id contains `name`."""
+def pick_stream(streams, name, skip=0):
+    """Return the (skip+1)-th stream whose name or source_id contains `name`."""
     name_l = name.lower()
+    count = 0
     for s in streams:
         if name_l in s.name().lower() or name_l in s.source_id().lower():
-            return s
+            if count == skip:
+                return s
+            count += 1
     return None
 
 
@@ -151,7 +155,7 @@ def record_both(name_a, name_b, duration):
     all_streams = find_eeg_streams(wait_time=8)
 
     stream_a = pick_stream(all_streams, name_a)
-    stream_b = pick_stream(all_streams, name_b)
+    stream_b = pick_stream(all_streams, name_b, skip=1 if name_a == name_b else 0)
 
     missing = []
     if stream_a is None:
@@ -318,8 +322,10 @@ print("\nProcessing ...")
 os.makedirs(OUT_DIR, exist_ok=True)
 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-path_a, mask_a = process_and_save(df_a, fs_a, NAME_A, stamp, marker_events)
-path_b, mask_b = process_and_save(df_b, fs_b, NAME_B, stamp, marker_events)
+label_a = NAME_A if NAME_A != NAME_B else f"{NAME_A}_A"
+label_b = NAME_B if NAME_A != NAME_B else f"{NAME_B}_B"
+path_a, mask_a = process_and_save(df_a, fs_a, label_a, stamp, marker_events)
+path_b, mask_b = process_and_save(df_b, fs_b, label_b, stamp, marker_events)
 
 if not _HAVE_SCIPY:
     print("\n  NOTE: scipy not found — anti-alias filter skipped. "

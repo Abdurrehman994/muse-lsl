@@ -4,18 +4,19 @@ moment the first frame appears on screen.
 
 IBS workflow
 ────────────────────────────────────────────────────────────────
-For each participant (run in separate sessions, same video):
+Both Muse headsets stream simultaneously to one recording:
 
-  Terminal 1:  python record_single.py 180
+  Terminal 1:  python record_both.py 180
   Terminal 2:  python play_stimulus.py clip.mp4
 
-  1. When both scripts are running, press ENTER in this terminal to start
-     the countdown and then play the video.
+  1. When both scripts are running, press ENTER in the video window to
+     start the countdown and then play the video.
   2. The LSL marker fires automatically when frame 0 hits the screen.
-  3. record_single.py captures the marker into a _markers.json sidecar.
+  3. record_both.py captures the marker into _markers.json sidecars
+     for both headsets.
 
-Analysis (after both sessions):
-  python pipeline.py recordings/<session_A>.csv recordings/<session_B>.csv \\
+Analysis (after recording):
+  python pipeline.py recordings/<stamp>_Muse.csv recordings/<stamp>_Muse_1.csv \\
          --surrogate 200
 
 The pipeline reads each _markers.json, trims both recordings to their
@@ -105,7 +106,7 @@ def play(video_path, marker_name, countdown_s, fullscreen):
     # LSL marker outlet
     outlet = build_outlet()
     print(f"\nLSL   : '{MARKER_STREAM_NAME}' stream live")
-    print("        Make sure record_single.py is running in another terminal\n")
+    print("        Make sure record_both.py is running in another terminal\n")
 
     win = "Stimulus"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
