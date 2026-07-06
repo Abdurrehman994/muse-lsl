@@ -46,6 +46,7 @@ import matplotlib
 matplotlib.use("Agg")  # no display needed
 import matplotlib.pyplot as plt
 import mne
+from mne.preprocessing import ICA
 
 from scipy.signal import hilbert, butter, filtfilt
 
@@ -165,10 +166,48 @@ def gap_runs_to_annotations(gap_mask, fs, start_time=0.0):
 # 2. PREPROCESS + EPOCH
 # ============================================================
 
-def preprocess(raw, l_freq=1.0, h_freq=40.0):
-    """Bandpass + average reference. Standard EEG hygiene."""
+def remove_blink_component(raw, subject_label, random_state=42):
+    """
+    Best-effort blink removal via ICA.
+
+    Muse has no dedicated EOG channel, so the frontal channel (AF7 or AF8,
+    most exposed to blinks) is used as a proxy target for
+    ICA.find_bads_eog(). Only 4 EEG channels are available in total, so
+    separation is weak compared to a real multi-channel montage — at most
+    the single most blink-correlated component is removed, to avoid
+    discarding real brain signal along with the artifact.
+    """
+    proxy_ch = next((ch for ch in raw.ch_names if ch.endswith("AF7") or ch.endswith("AF8")), None)
+    if proxy_ch is None:
+        print(f"     {subject_label}: ICA skipped — no frontal channel found for blink proxy")
+        return raw
+
+    ica = ICA(max_iter="auto", random_state=random_state)
+    ica.fit(raw, verbose=False)
+
+    try:
+        eog_indices, _ = ica.find_bads_eog(raw, ch_name=proxy_ch, verbose=False)
+    except Exception as e:
+        print(f"     {subject_label}: ICA blink-detection via {proxy_ch} failed ({e}) — no components removed")
+        return raw
+
+    if not eog_indices:
+        print(f"     {subject_label}: ICA found no clear blink component — no components removed")
+        return raw
+
+    ica.exclude = eog_indices[:1]
+    print(f"     {subject_label}: ICA removed component {ica.exclude} (blink-correlated via {proxy_ch})")
+    raw_clean = raw.copy()
+    ica.apply(raw_clean, verbose=False)
+    return raw_clean
+
+
+def preprocess(raw, l_freq=1.0, h_freq=40.0, use_ica=False, subject_label=""):
+    """Bandpass + optional ICA blink removal + average reference."""
     raw = raw.copy()
     raw.filter(l_freq=l_freq, h_freq=h_freq, picks="eeg", verbose=False)
+    if use_ica:
+        raw = remove_blink_component(raw, subject_label)
     # average reference across that subject's channels only
     raw.set_eeg_reference("average", projection=False, verbose=False)
     return raw
@@ -452,6 +491,10 @@ def main():
     p.add_argument("--amplitude-threshold", type=float, default=150.0,
                    help="peak-to-peak amplitude threshold in µV for epoch rejection "
                         "(default 150). Lower = stricter. 0 = disabled.")
+    p.add_argument("--ica", action="store_true",
+                   help="remove the single most blink-correlated ICA component per "
+                        "subject before referencing (experimental — only 4 channels "
+                        "available, so separation is weak)")
     p.add_argument("--out-dir", default=None)
     args = p.parse_args()
 
@@ -487,9 +530,10 @@ def main():
     # cap high-pass cutoff below Nyquist; for 64 Hz that's <32 Hz
     nyq = fs_a / 2
     h_freq = min(40.0, nyq * 0.95)
-    print(f"  bandpass 1-{h_freq:.0f} Hz, average reference")
-    raw_a_pp = preprocess(raw_a, h_freq=h_freq)
-    raw_b_pp = preprocess(raw_b, h_freq=h_freq)
+    ica_str = " + ICA blink removal" if args.ica else ""
+    print(f"  bandpass 1-{h_freq:.0f} Hz{ica_str}, average reference")
+    raw_a_pp = preprocess(raw_a, h_freq=h_freq, use_ica=args.ica, subject_label="A")
+    raw_b_pp = preprocess(raw_b, h_freq=h_freq, use_ica=args.ica, subject_label="B")
 
     plot_raw_with_gaps(raw_a_pp, raw_b_pp, os.path.join(out_dir, "raw_with_gaps.png"))
     plot_psd(raw_a_pp, raw_b_pp, os.path.join(out_dir, "psd.png"))
