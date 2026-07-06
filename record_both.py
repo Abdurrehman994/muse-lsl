@@ -52,7 +52,6 @@ OUT_DIR          = "recordings"
 TARGET_FS        = 256
 WIN_SECONDS      = 5
 GAP_THRESHOLD_MS = 20.0
-MARKER_SEARCH_SECONDS = 15.0  # keep watching for a late-starting marker stream
 
 # vertical offsets so channels don't overlap on the live plot
 OFFSETS = np.array([300, 200, 100, 0])
@@ -178,8 +177,8 @@ def record_both(name_a, name_b, duration):
     print(f"Connected to '{stream_b.name()}' ({fs_b} Hz) as Subject B")
     print(f"Recording {duration}s. Close the plot window to stop early.\n")
 
-    # optional stimulus marker stream — checked now, and re-checked for the
-    # first MARKER_SEARCH_SECONDS of recording in case it starts a beat late
+    # optional stimulus marker stream — checked now, and re-checked
+    # throughout the whole recording in case it starts later
     marker_inlet = None
     marker_streams = [s for s in resolve_streams(wait_time=1.0)
                       if s.name() == "StimulusMarkers"]
@@ -187,9 +186,9 @@ def record_both(name_a, name_b, duration):
         marker_inlet = StreamInlet(marker_streams[0])
         print("  Stimulus marker stream connected — press Enter in stimulus_marker.py when ready.\n")
     else:
-        print(f"  No stimulus marker stream yet — will keep watching for the first "
-              f"{MARKER_SEARCH_SECONDS:.0f}s of recording. Run stimulus_marker.py or "
-              f"play_stimulus.py any time before then for IBS alignment.\n")
+        print("  No stimulus marker stream yet — will keep watching for one for the "
+              "rest of this recording. Run stimulus_marker.py or play_stimulus.py "
+              "any time before firing the marker, in any order relative to this script.\n")
 
     data_a, data_b = [], []
     marker_events = []
@@ -227,7 +226,7 @@ def record_both(name_a, name_b, duration):
         pull_into(inlet_a, data_a, "a")
         pull_into(inlet_b, data_b, "b")
 
-        if (marker_inlet is None and elapsed < MARKER_SEARCH_SECONDS
+        if (marker_inlet is None
                 and elapsed - state["last_marker_check"] >= 1.0):
             state["last_marker_check"] = elapsed
             found = [s for s in resolve_streams(wait_time=0.2)

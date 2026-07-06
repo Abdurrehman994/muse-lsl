@@ -140,6 +140,16 @@ def play(video_path, marker_name, countdown_s, fullscreen):
                 cv2.waitKey(40)
 
     # ── marker + playback (as atomic as Python allows) ────────
+    if not outlet.have_consumers():
+        print("\n  WARNING: no recorder is connected to the marker stream yet — "
+              "waiting up to 2s for record_both.py to connect ...")
+        outlet.wait_for_consumers(2.0)
+
+    had_consumer = outlet.have_consumers()
+    if not had_consumer:
+        print("  WARNING: still no recorder connected. The marker will be sent "
+              "anyway, but nothing is listening — it will NOT be captured.")
+
     t_marker = local_clock()
     outlet.push_sample([marker_name], t_marker)
 
@@ -177,8 +187,13 @@ def play(video_path, marker_name, countdown_s, fullscreen):
     cv2.destroyAllWindows()
 
     print(f"  Playback ended.")
-    print(f"  Stimulus marker is saved in the recording's _markers.json sidecar.")
-    print(f"  The pipeline will use it to align this session to t=0 = stimulus onset.")
+    if had_consumer:
+        print(f"  A recorder was connected when the marker fired — check that "
+              f"recording's _markers.json sidecar to confirm it was captured.")
+        print(f"  The pipeline will use it to align this session to t=0 = stimulus onset.")
+    else:
+        print(f"  WARNING: no recorder was connected when the marker fired — "
+              f"it was NOT saved anywhere. This session has no stimulus marker.")
 
 
 def main():
