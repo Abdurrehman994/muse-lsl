@@ -130,6 +130,26 @@ def play(video_path, marker_name, countdown_s, fullscreen):
             print("Aborted.")
             return
 
+    # ── wait for a recorder to connect (record_both.py's own startup — EEG
+    # stream scan + inlet connections — can easily take 10-15s) ───────────
+    if not outlet.have_consumers():
+        print("\nWaiting for record_both.py to connect to the marker stream "
+              "(up to 30s) — make sure it's already running ...")
+        waited = 0.0
+        while waited < 30.0 and not outlet.have_consumers():
+            cv2.imshow(win, text_frame(shape, ["Waiting for recorder...",
+                                                f"{waited:.0f}s / 30s"]))
+            cv2.waitKey(1)
+            outlet.wait_for_consumers(1.0)
+            waited += 1.0
+
+    had_consumer = outlet.have_consumers()
+    if had_consumer:
+        print("  Recorder connected.")
+    else:
+        print("  WARNING: no recorder connected after 30s. Proceeding anyway, "
+              "but the marker will NOT be captured.")
+
     # ── countdown ─────────────────────────────────────────────
     if countdown_s > 0:
         print(f"Countdown: {countdown_s}s ...")
@@ -140,15 +160,6 @@ def play(video_path, marker_name, countdown_s, fullscreen):
                 cv2.waitKey(40)
 
     # ── marker + playback (as atomic as Python allows) ────────
-    if not outlet.have_consumers():
-        print("\n  WARNING: no recorder is connected to the marker stream yet — "
-              "waiting up to 2s for record_both.py to connect ...")
-        outlet.wait_for_consumers(2.0)
-
-    had_consumer = outlet.have_consumers()
-    if not had_consumer:
-        print("  WARNING: still no recorder connected. The marker will be sent "
-              "anyway, but nothing is listening — it will NOT be captured.")
 
     t_marker = local_clock()
     outlet.push_sample([marker_name], t_marker)
