@@ -137,7 +137,7 @@ def record_one(name, duration):
             now = local_clock()
             if now - state["last_scan"] > 2.0:
                 state["last_scan"] = now
-                streams = [s for s in resolve_streams(wait_time=0.0)
+                streams = [s for s in resolve_streams(wait_time=0.2)
                            if s.name() == "StimulusMarkers"]
                 if streams:
                     state["marker_inlet"] = StreamInlet(streams[0])

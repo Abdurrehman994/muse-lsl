@@ -56,7 +56,16 @@ FREQ_BANDS = {
     "theta": (4.0, 8.0),
     "alpha": (8.0, 13.0),
     "beta":  (13.0, 30.0),
+    # capped at 45 Hz rather than the classic 30-100 Hz gamma range: on a
+    # 4-channel dry system, frontal channels (AF7/AF8) pick up EMG/micro-saccade
+    # noise well before 100 Hz, so anything higher is mostly muscle, not cortex.
+    "gamma": (30.0, 45.0),
 }
+
+# markers written by eye_contact_task.py — presence of either means this
+# recording is a block-design (condition-switching) session, not a single
+# stimulus-onset one.
+CONDITION_MARKER_PREFIXES = ("EYE_CONTACT", "GAZE_AVERSION")
 
 
 # ============================================================
@@ -79,6 +88,46 @@ def load_stimulus_onset(csv_path):
     if markers:
         return float(markers[0]["rel_time_s"])
     return None
+
+
+def load_all_markers(csv_path):
+    """Every marker event in the _markers.json sidecar, sorted by time."""
+    sidecar = csv_path.replace(".csv", "_markers.json")
+    if not os.path.exists(sidecar):
+        return []
+    with open(sidecar) as f:
+        markers = json.load(f)
+    return sorted(markers, key=lambda m: m["rel_time_s"])
+
+
+def condition_label(marker_name):
+    """'EYE_CONTACT_start' -> 'EYE_CONTACT', or None if not a condition marker."""
+    for prefix in CONDITION_MARKER_PREFIXES:
+        if prefix in marker_name:
+            return prefix
+    return None
+
+
+def is_block_design(markers):
+    return any(condition_label(m.get("marker", "")) is not None for m in markers)
+
+
+def build_condition_segments(markers, recording_end_s):
+    """
+    Turn a sorted marker list into (condition_label, start_s, end_s) segments —
+    each condition marker starts a block that runs until the next marker (or
+    the end of the recording, for the last block).
+    """
+    block_markers = [m for m in markers if condition_label(m["marker"]) is not None]
+    segments = []
+    for i, m in enumerate(block_markers):
+        start = float(m["rel_time_s"])
+        if i + 1 < len(block_markers):
+            end = float(block_markers[i + 1]["rel_time_s"])
+        else:
+            end = recording_end_s
+        segments.append((condition_label(m["marker"]), start, end))
+    return segments
 
 
 def load_csv_to_raw(csv_path, subject_label, onset_s=None):
@@ -234,6 +283,34 @@ def epoch_with_gap_rejection(raw, epoch_len_s, overlap_s, amplitude_uv=150.0):
     return epochs
 
 
+def epoch_by_condition(raw, segments, epoch_len_s, overlap_s, amplitude_uv=150.0):
+    """
+    Crop `raw` to each (condition_label, start_s, end_s) block and epoch it
+    separately, then concatenate all blocks that share the same condition
+    label (a condition is usually repeated across several blocks).
+
+    Returns: dict condition_label -> mne.Epochs. Blocks shorter than one
+    epoch, or that yield zero surviving epochs, are skipped.
+    """
+    by_condition = {}
+    t_end = raw.times[-1]
+    for label, start, end in segments:
+        start = max(0.0, start)
+        end = min(end, t_end)
+        if end - start < epoch_len_s:
+            continue
+        raw_seg = raw.copy().crop(tmin=start, tmax=end)
+        epochs = epoch_with_gap_rejection(raw_seg, epoch_len_s, overlap_s, amplitude_uv)
+        if len(epochs) == 0:
+            continue
+        by_condition.setdefault(label, []).append(epochs)
+
+    return {
+        label: (mne.concatenate_epochs(ep_list) if len(ep_list) > 1 else ep_list[0])
+        for label, ep_list in by_condition.items()
+    }
+
+
 # ============================================================
 # 3. PLV
 # ============================================================
@@ -360,6 +437,79 @@ def surrogate_plv_distribution(epochs_a, epochs_b, band, n_surrogates, seed=0):
     return np.array(nulls)  # shape (n_surrogates, n_chan_a, n_chan_b)
 
 
+def compute_band_phases(epochs, band):
+    """(n_ep, n_chan, n_samples) instantaneous phase, band-limited via Hilbert."""
+    fs = epochs.info["sfreq"]
+    lo, hi = band
+    nyq = fs / 2
+    if hi >= nyq:
+        hi = nyq * 0.99
+    b, a = butter(4, [lo / nyq, hi / nyq], btype="band")
+    xf = filtfilt(b, a, epochs.get_data(), axis=-1)
+    return np.angle(hilbert(xf, axis=-1))
+
+
+def plv_from_phases(phi_a, phi_b):
+    """PLV per channel pair, averaged across epochs, from precomputed phases."""
+    n_chan_a = phi_a.shape[1]
+    n_chan_b = phi_b.shape[1]
+    plv = np.zeros((n_chan_a, n_chan_b))
+    for i in range(n_chan_a):
+        for j in range(n_chan_b):
+            d = phi_a[:, i, :] - phi_b[:, j, :]
+            plv[i, j] = np.abs(np.mean(np.exp(1j * d), axis=-1)).mean()
+    return plv
+
+
+def condition_contrast(epochs_a_by_cond, epochs_b_by_cond, band, cond1, cond2,
+                        n_perm=200, seed=0):
+    """
+    Test whether inter-brain PLV differs between two task conditions (e.g.
+    EYE_CONTACT vs GAZE_AVERSION), via a label-permutation test: pool every
+    matched (A, B) epoch pair from both conditions, then repeatedly reshuffle
+    which pairs count as cond1 vs cond2 (keeping the original group sizes) to
+    build a null distribution for the PLV difference.
+
+    Returns (plv1, plv2, diff, p_value); diff = plv1 - plv2, p_value is
+    two-sided against the permuted null. Returns all-None if either condition
+    is missing epochs for this subject pair.
+    """
+    ep_a1, ep_b1 = epochs_a_by_cond.get(cond1), epochs_b_by_cond.get(cond1)
+    ep_a2, ep_b2 = epochs_a_by_cond.get(cond2), epochs_b_by_cond.get(cond2)
+    if ep_a1 is None or ep_b1 is None or ep_a2 is None or ep_b2 is None:
+        return None, None, None, None
+
+    n1 = min(len(ep_a1), len(ep_b1))
+    n2 = min(len(ep_a2), len(ep_b2))
+    if n1 == 0 or n2 == 0:
+        return None, None, None, None
+
+    phi_a1 = compute_band_phases(ep_a1[:n1], band)
+    phi_b1 = compute_band_phases(ep_b1[:n1], band)
+    phi_a2 = compute_band_phases(ep_a2[:n2], band)
+    phi_b2 = compute_band_phases(ep_b2[:n2], band)
+
+    plv1 = plv_from_phases(phi_a1, phi_b1)
+    plv2 = plv_from_phases(phi_a2, phi_b2)
+    diff = plv1 - plv2
+
+    phi_a_pool = np.concatenate([phi_a1, phi_a2], axis=0)
+    phi_b_pool = np.concatenate([phi_b1, phi_b2], axis=0)
+    n_total = n1 + n2
+
+    rng = np.random.default_rng(seed)
+    null_diffs = np.zeros((n_perm,) + diff.shape)
+    for k in range(n_perm):
+        perm = rng.permutation(n_total)
+        idx1, idx2 = perm[:n1], perm[n1:]
+        p1 = plv_from_phases(phi_a_pool[idx1], phi_b_pool[idx1])
+        p2 = plv_from_phases(phi_a_pool[idx2], phi_b_pool[idx2])
+        null_diffs[k] = p1 - p2
+
+    p_value = (np.abs(null_diffs) >= np.abs(diff)[None, :, :]).mean(axis=0)
+    return plv1, plv2, diff, p_value
+
+
 # ============================================================
 # 4. PLOTS
 # ============================================================
@@ -414,6 +564,29 @@ def plot_plv_matrix(plv, band_name, out_path, surrogate_p=None):
                 star = "*"
             ax.text(j, i, f"{val:.2f}{star}", ha="center", va="center",
                     color="white" if val < 0.5 else "black", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+def plot_plv_diff_matrix(diff, band_name, cond1, cond2, out_path, p_values=None):
+    vmax = max(0.05, float(np.abs(diff).max()))
+    fig, ax = plt.subplots(figsize=(5, 4.5))
+    im = ax.imshow(diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    ax.set_xticks(range(len(CH_NAMES)))
+    ax.set_yticks(range(len(CH_NAMES)))
+    ax.set_xticklabels([f"B:{c}" for c in CH_NAMES])
+    ax.set_yticklabels([f"A:{c}" for c in CH_NAMES])
+    ax.set_title(f"PLV diff ({cond1} - {cond2}) — {band_name}")
+    plt.colorbar(im, ax=ax, label="Δ PLV")
+    for i in range(diff.shape[0]):
+        for j in range(diff.shape[1]):
+            val = diff[i, j]
+            star = ""
+            if p_values is not None and p_values[i, j] < 0.05:
+                star = "*"
+            ax.text(j, i, f"{val:+.2f}{star}", ha="center", va="center",
+                    color="black", fontsize=9)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -484,8 +657,10 @@ def main():
                    help="epoch length in seconds (default 2.0)")
     p.add_argument("--epoch-overlap", type=float, default=1.0,
                    help="epoch overlap in seconds (default 1.0)")
-    p.add_argument("--bands", nargs="+", default=list(FREQ_BANDS.keys()),
-                   help="which bands to compute (theta alpha beta)")
+    p.add_argument("--bands", nargs="+", default=["theta", "alpha", "beta"],
+                   help="which bands to compute (theta alpha beta gamma). "
+                        "gamma is opt-in: it needs a wider bandpass, which "
+                        "lets in more high-frequency noise (see --amplitude-threshold).")
     p.add_argument("--surrogate", type=int, default=0,
                    help="number of surrogate permutations for significance (0=off)")
     p.add_argument("--amplitude-threshold", type=float, default=150.0,
@@ -495,6 +670,9 @@ def main():
                    help="remove the single most blink-correlated ICA component per "
                         "subject before referencing (experimental — only 4 channels "
                         "available, so separation is weak)")
+    p.add_argument("--contrast-surrogates", type=int, default=200,
+                   help="permutations for the condition-vs-condition contrast in "
+                        "block-design (eye_contact_task.py) recordings (default 200)")
     p.add_argument("--out-dir", default=None)
     args = p.parse_args()
 
@@ -506,17 +684,27 @@ def main():
     print("="*60)
     print("LOADING")
     print("="*60)
-    onset_a = load_stimulus_onset(args.csv_a)
-    onset_b = load_stimulus_onset(args.csv_b)
-    if onset_a is not None and onset_b is not None:
-        print(f"  IBS mode: stimulus markers found "
-              f"(A={onset_a:.3f}s, B={onset_b:.3f}s)")
-    elif onset_a is not None or onset_b is not None:
-        print("  WARNING: only one recording has a stimulus marker — "
-              "alignment skipped")
+    markers_a = load_all_markers(args.csv_a)
+    markers_b = load_all_markers(args.csv_b)
+    block_design = is_block_design(markers_a) or is_block_design(markers_b)
+
+    if block_design:
+        print("  Block-design condition markers found (eye_contact_task.py) — "
+              "will analyze per-condition instead of a single stimulus trim.")
         onset_a = onset_b = None
     else:
-        print("  No stimulus markers found — using full recordings")
+        onset_a = load_stimulus_onset(args.csv_a)
+        onset_b = load_stimulus_onset(args.csv_b)
+        if onset_a is not None and onset_b is not None:
+            print(f"  IBS mode: stimulus markers found "
+                  f"(A={onset_a:.3f}s, B={onset_b:.3f}s)")
+        elif onset_a is not None or onset_b is not None:
+            print("  WARNING: only one recording has a stimulus marker — "
+                  "alignment skipped")
+            onset_a = onset_b = None
+        else:
+            print("  No stimulus markers found — using full recordings")
+
     raw_a, fs_a = load_csv_to_raw(args.csv_a, "A", onset_s=onset_a)
     raw_b, fs_b = load_csv_to_raw(args.csv_b, "B", onset_s=onset_b)
     if fs_a != fs_b:
@@ -527,9 +715,12 @@ def main():
     print("="*60)
     print("PREPROCESSING")
     print("="*60)
-    # cap high-pass cutoff below Nyquist; for 64 Hz that's <32 Hz
+    # cap high-pass cutoff below Nyquist; widen it only if gamma was requested —
+    # a wider passband lets in more EMG/muscle noise, which otherwise silently
+    # inflates epoch rejection for everyone still using theta/alpha/beta
     nyq = fs_a / 2
-    h_freq = min(40.0, nyq * 0.95)
+    wants_gamma = "gamma" in args.bands
+    h_freq = min(48.0 if wants_gamma else 40.0, nyq * 0.95)
     ica_str = " + ICA blink removal" if args.ica else ""
     print(f"  bandpass 1-{h_freq:.0f} Hz{ica_str}, average reference")
     raw_a_pp = preprocess(raw_a, h_freq=h_freq, use_ica=args.ica, subject_label="A")
@@ -538,6 +729,16 @@ def main():
     plot_raw_with_gaps(raw_a_pp, raw_b_pp, os.path.join(out_dir, "raw_with_gaps.png"))
     plot_psd(raw_a_pp, raw_b_pp, os.path.join(out_dir, "psd.png"))
 
+    if block_design:
+        run_condition_pipeline(raw_a_pp, raw_b_pp, markers_a, markers_b,
+                                fs_a, nyq, args, out_dir)
+    else:
+        run_legacy_pipeline(raw_a_pp, raw_b_pp, fs_a, nyq, args, out_dir)
+
+
+def run_legacy_pipeline(raw_a_pp, raw_b_pp, fs_a, nyq, args, out_dir):
+    """Whole-recording epoching + per-band PLV/circ-corr vs. a surrogate null —
+    the original single-condition (or unmarked) analysis path."""
     print()
     print("="*60)
     print("EPOCHING")
@@ -560,6 +761,9 @@ def main():
         print("  No surviving epochs. The recording is too gappy for this "
               "epoch length.")
         print("  Try:  --epoch-len 1.0 --epoch-overlap 0.5")
+        if "gamma" in args.bands:
+            print("  gamma widens the bandpass to 45 Hz, which lets in more "
+                  "EMG/muscle noise — try:  --amplitude-threshold 250")
         print("  Or: get cleaner data (single-BT-adapter problem).")
         sys.exit(0)
 
@@ -651,6 +855,135 @@ def main():
     print("  raw_with_gaps.png           - signal + gap markers")
     print("  psd.png                     - power spectrum QC")
     print("  summary.txt                 - numerical summary")
+
+
+def run_condition_pipeline(raw_a_pp, raw_b_pp, markers_a, markers_b,
+                            fs_a, nyq, args, out_dir):
+    """Per-condition epoching (EYE_CONTACT vs GAZE_AVERSION blocks) + a direct
+    PLV contrast between the two conditions, in addition to each condition's
+    own PLV/circ-corr."""
+    print()
+    print("="*60)
+    print("EPOCHING PER CONDITION")
+    print("="*60)
+    amp_thresh = args.amplitude_threshold if args.amplitude_threshold > 0 else None
+    thresh_str = f"{amp_thresh} µV" if amp_thresh else "disabled"
+    print(f"  epoch_len={args.epoch_len}s  overlap={args.epoch_overlap}s  "
+          f"amplitude_threshold={thresh_str}")
+
+    segments_a = build_condition_segments(markers_a, raw_a_pp.times[-1])
+    segments_b = build_condition_segments(markers_b, raw_b_pp.times[-1])
+    for label in sorted(set(l for l, _, _ in segments_a)):
+        n_blocks = sum(1 for l, _, _ in segments_a if l == label)
+        print(f"  A: {n_blocks} block(s) of {label}")
+    for label in sorted(set(l for l, _, _ in segments_b)):
+        n_blocks = sum(1 for l, _, _ in segments_b if l == label)
+        print(f"  B: {n_blocks} block(s) of {label}")
+
+    epochs_a_by_cond = epoch_by_condition(raw_a_pp, segments_a, args.epoch_len,
+                                          args.epoch_overlap, amp_thresh or 1e9)
+    epochs_b_by_cond = epoch_by_condition(raw_b_pp, segments_b, args.epoch_len,
+                                          args.epoch_overlap, amp_thresh or 1e9)
+    conditions = sorted(set(epochs_a_by_cond) & set(epochs_b_by_cond))
+    if not conditions:
+        print("  No condition has surviving epochs in both subjects — "
+              "the recording may be too gappy for this epoch length.")
+        print("  Try:  --epoch-len 1.0 --epoch-overlap 0.5")
+        if "gamma" in args.bands:
+            print("  gamma widens the bandpass to 45 Hz, which lets in more "
+                  "EMG/muscle noise — try:  --amplitude-threshold 250")
+        sys.exit(0)
+    print(f"  Conditions with usable epochs in both subjects: {conditions}")
+
+    print()
+    print("="*60)
+    print("PLV + CIRCULAR CORRELATION PER CONDITION PER BAND")
+    print("="*60)
+    summary_lines = [f"Hyperscanning (block-design) summary  {datetime.now().isoformat()}"]
+    summary_lines.append(f"  A: {args.csv_a}")
+    summary_lines.append(f"  B: {args.csv_b}")
+    summary_lines.append(f"  fs={fs_a:.0f} Hz, epoch_len={args.epoch_len}s")
+    summary_lines.append(f"  conditions: {conditions}")
+    summary_lines.append("")
+
+    plvs_by_cond_band = {}
+    for cond in conditions:
+        ep_a, ep_b = epochs_a_by_cond[cond], epochs_b_by_cond[cond]
+        n_ep = min(len(ep_a), len(ep_b))
+        ep_a, ep_b = ep_a[:n_ep], ep_b[:n_ep]
+        print(f"\n  -- {cond}  ({n_ep} matched epochs) --")
+        summary_lines.append(f"  -- {cond}  ({n_ep} matched epochs) --")
+
+        for band_name in args.bands:
+            if band_name not in FREQ_BANDS:
+                continue
+            band = FREQ_BANDS[band_name]
+            if band[1] >= nyq:
+                continue
+            plv = plv_manual(ep_a, ep_b, band)
+            plvs_by_cond_band[(cond, band_name)] = plv
+            line = (f"     {band_name:6s} ({band[0]:4.1f}-{band[1]:4.1f} Hz): "
+                    f"mean PLV = {plv.mean():.3f}  max = {plv.max():.3f}")
+            print(line)
+            summary_lines.append(line)
+            np.save(os.path.join(out_dir, f"plv_{cond}_{band_name}.npy"), plv)
+            plot_plv_matrix(
+                plv, f"{cond} / {band_name}",
+                os.path.join(out_dir, f"plv_interbrain_{cond}_{band_name}.png"),
+            )
+
+    if len(conditions) >= 2:
+        print()
+        print("="*60)
+        print("CONDITION CONTRAST (permutation test)")
+        print("="*60)
+        cond1, cond2 = conditions[0], conditions[1]
+        if len(conditions) > 2:
+            print(f"  More than 2 conditions found — contrasting the first two: "
+                  f"{cond1} vs {cond2}")
+        summary_lines.append("")
+        summary_lines.append(f"  Contrast: {cond1} vs {cond2} "
+                             f"({args.contrast_surrogates} permutations)")
+
+        for band_name in args.bands:
+            if band_name not in FREQ_BANDS:
+                continue
+            band = FREQ_BANDS[band_name]
+            if band[1] >= nyq:
+                continue
+            plv1, plv2, diff, p_val = condition_contrast(
+                epochs_a_by_cond, epochs_b_by_cond, band, cond1, cond2,
+                n_perm=args.contrast_surrogates,
+            )
+            if diff is None:
+                continue
+            n_sig = int((p_val < 0.05).sum())
+            line = (f"  {band_name:6s} ({band[0]:4.1f}-{band[1]:4.1f} Hz): "
+                    f"mean PLV diff ({cond1}-{cond2}) = {diff.mean():+.3f}  "
+                    f"significant pairs (p<0.05): {n_sig}/{diff.size}")
+            print(line)
+            summary_lines.append(line)
+            np.save(os.path.join(out_dir, f"plv_diff_{band_name}.npy"), diff)
+            np.save(os.path.join(out_dir, f"plv_diff_p_{band_name}.npy"), p_val)
+            plot_plv_diff_matrix(
+                diff, band_name, cond1, cond2,
+                os.path.join(out_dir, f"plv_diff_{band_name}.png"),
+                p_values=p_val,
+            )
+    else:
+        print("\n  Only one condition present — skipping condition contrast.")
+
+    with open(os.path.join(out_dir, "summary.txt"), "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+
+    print()
+    print(f"Wrote outputs to: {out_dir}")
+    print("  plv_<condition>_<band>.npy         - PLV matrices per condition")
+    print("  plv_interbrain_<condition>_<band>.png")
+    print("  plv_diff_<band>.npy / .png          - condition contrast (cond1 - cond2)")
+    print("  raw_with_gaps.png                   - signal + gap markers")
+    print("  psd.png                             - power spectrum QC")
+    print("  summary.txt                         - numerical summary")
 
 
 if __name__ == "__main__":
