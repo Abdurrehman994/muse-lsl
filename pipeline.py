@@ -574,11 +574,18 @@ def main():
         print("  Or: get cleaner data (single-BT-adapter problem).")
         sys.exit(0)
 
-    # match epoch counts between subjects (drop tail of whichever is longer)
-    n_ep = min(len(epochs_a), len(epochs_b))
-    epochs_a = epochs_a[:n_ep]
-    epochs_b = epochs_b[:n_ep]
-    print(f"  Using {n_ep} matched epochs for connectivity.")
+    # Match epochs by original time-slot index, not by position in each
+    # subject's own surviving list. A and B reject different epochs (whichever
+    # overlap THEIR OWN gaps/artifacts), so truncating by position pairs
+    # epochs from different real-world moments -- e.g. A's epoch #5 (its 5th
+    # survivor) might be B's epoch #9 in time, growing worse the more the two
+    # subjects' rejections diverge. Keep only slots that survived in both.
+    common = np.intersect1d(epochs_a.selection, epochs_b.selection)
+    epochs_a = epochs_a[np.isin(epochs_a.selection, common)]
+    epochs_b = epochs_b[np.isin(epochs_b.selection, common)]
+    n_ep = len(common)
+    print(f"  Using {n_ep} time-aligned matched epochs for connectivity "
+          f"(kept only time slots that survived rejection in both subjects).")
 
     print()
     print("="*60)

@@ -11,6 +11,8 @@ Usage:
 """
 import argparse
 
+import numpy as np
+
 from pipeline import (
     FREQ_BANDS,
     circular_corr_manual,
@@ -41,10 +43,16 @@ def run_condition(csv_a, csv_b, epoch_len, overlap, amp_thresh, bands,
                                         amplitude_uv=amp_thresh or 1e9)
     epochs_b = epoch_with_gap_rejection(raw_b_pp, epoch_len, overlap,
                                         amplitude_uv=amp_thresh or 1e9)
-    n_ep = min(len(epochs_a), len(epochs_b))
-    if n_ep == 0:
+    if len(epochs_a) == 0 or len(epochs_b) == 0:
         return None
-    epochs_a, epochs_b = epochs_a[:n_ep], epochs_b[:n_ep]
+    # match by original time-slot index, not by position in each subject's
+    # own surviving list -- see pipeline.py main() for why that matters.
+    common = np.intersect1d(epochs_a.selection, epochs_b.selection)
+    if len(common) == 0:
+        return None
+    epochs_a = epochs_a[np.isin(epochs_a.selection, common)]
+    epochs_b = epochs_b[np.isin(epochs_b.selection, common)]
+    n_ep = len(common)
 
     results = {}
     for band_name in bands:
