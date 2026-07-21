@@ -52,6 +52,8 @@ OUT_DIR          = "recordings"
 TARGET_FS        = 256
 WIN_SECONDS      = 5
 GAP_THRESHOLD_MS = 20.0
+STREAM_DROP_TIMEOUT_S = 3.0
+STREAM_DROP_GRACE_S   = 10.0
 
 # vertical offsets so channels don't overlap on the live plot
 OFFSETS = np.array([300, 200, 100, 0])
@@ -164,9 +166,16 @@ def record_both(name_a, name_b, duration):
         missing.append(name_b)
     if missing:
         print(f"\nERROR: could not find stream(s): {missing}")
+        if all_streams:
+            print("Available EEG streams right now:")
+            for s in all_streams:
+                print(f"  - '{s.name()}'  source_id={s.source_id()}")
+        else:
+            print("No EEG streams were discovered at all.")
         print("Make sure muselsl stream is running for each headset, e.g.:")
         print(f"  muselsl stream --address <MAC_A> --name {name_a}")
         print(f"  muselsl stream --address <MAC_B> --name {name_b}")
+        print("If you are unsure of the stream names, run muselsl list in the terminals that start the streams.")
         raise SystemExit(1)
 
     inlet_a = StreamInlet(stream_a, max_buflen=duration + 5)
@@ -197,7 +206,13 @@ def record_both(name_a, name_b, duration):
         "a": np.full((win_samples, 4), np.nan),
         "b": np.full((win_samples, 4), np.nan),
     }
-    state = {"start": None, "last_marker_check": -999.0}
+    state = {
+        "start": None,
+        "last_marker_check": -999.0,
+        "last_a": None,
+        "last_b": None,
+        "stop_reason": None,
+    }
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
     fig.suptitle(f"Live EEG — {name_a} (top) vs {name_b} (bottom)")
@@ -206,7 +221,7 @@ def record_both(name_a, name_b, duration):
         try:
             samples, ts = inlet.pull_chunk(timeout=0.0)
         except Exception:
-            return
+            return 0
         if samples:
             s = np.array(samples, dtype=float)[:, :n_ch]
             n = len(s)
@@ -216,6 +231,8 @@ def record_both(name_a, name_b, duration):
             b = np.roll(b, -n, axis=0)
             b[-n:, :] = s
             buf[buf_key] = b
+            return n
+        return 0
 
     def update(_):
         nonlocal marker_inlet
@@ -223,8 +240,28 @@ def record_both(name_a, name_b, duration):
             state["start"] = local_clock()
         elapsed = local_clock() - state["start"]
 
-        pull_into(inlet_a, data_a, "a")
-        pull_into(inlet_b, data_b, "b")
+        pulled_a = pull_into(inlet_a, data_a, "a")
+        pulled_b = pull_into(inlet_b, data_b, "b")
+        if pulled_a:
+            state["last_a"] = elapsed
+        if pulled_b:
+            state["last_b"] = elapsed
+
+        if elapsed >= STREAM_DROP_GRACE_S:
+            stale = []
+            if state["last_a"] is None or elapsed - state["last_a"] > STREAM_DROP_TIMEOUT_S:
+                stale.append(name_a)
+            if state["last_b"] is None or elapsed - state["last_b"] > STREAM_DROP_TIMEOUT_S:
+                stale.append(name_b)
+            if stale:
+                state["stop_reason"] = (
+                    f"stream timeout detected for {', '.join(stale)} "
+                    f"(no samples for > {STREAM_DROP_TIMEOUT_S:.1f}s)"
+                )
+                print(f"\n  WARNING: stream dropout detected — {state['stop_reason']}.")
+                print("           Stopping early to avoid a one-sided tail.")
+                plt.close(fig)
+                return
 
         if (marker_inlet is None
                 and elapsed - state["last_marker_check"] >= 1.0):
@@ -274,12 +311,15 @@ def record_both(name_a, name_b, duration):
     plt.tight_layout()
     plt.show()
 
+    if state["stop_reason"]:
+        print(f"  Recording stopped early due to stream dropout: {state['stop_reason']}")
+
     inlet_a.close_stream()
     inlet_b.close_stream()
 
     df_a = pd.DataFrame(data_a, columns=["lsl_timestamp"] + CH_NAMES)
     df_b = pd.DataFrame(data_b, columns=["lsl_timestamp"] + CH_NAMES)
-    return df_a, df_b, fs_a, fs_b, marker_events
+    return df_a, df_b, fs_a, fs_b, marker_events, state["stop_reason"]
 
 
 # ============================================================
@@ -330,7 +370,7 @@ print(f"  muselsl stream --address <MAC_B> --name {NAME_B}")
 print("=" * 60)
 input("Press Enter when ready to start recording ...")
 
-df_a, df_b, fs_a, fs_b, marker_events = record_both(NAME_A, NAME_B, DURATION)
+df_a, df_b, fs_a, fs_b, marker_events, stop_reason = record_both(NAME_A, NAME_B, DURATION)
 
 print("\nProcessing ...")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -340,6 +380,17 @@ label_a = NAME_A if NAME_A != NAME_B else f"{NAME_A}_A"
 label_b = NAME_B if NAME_A != NAME_B else f"{NAME_B}_B"
 path_a, mask_a = process_and_save(df_a, fs_a, label_a, stamp, marker_events)
 path_b, mask_b = process_and_save(df_b, fs_b, label_b, stamp, marker_events)
+
+session_summary_path = os.path.join(OUT_DIR, f"{stamp}_session_summary.txt")
+with open(session_summary_path, "w") as f:
+    f.write(f"Recording summary {datetime.now().isoformat()}\n")
+    f.write(f"A: {label_a}  samples={len(df_a)}  fs={fs_a}\n")
+    f.write(f"B: {label_b}  samples={len(df_b)}  fs={fs_b}\n")
+    if stop_reason:
+        f.write(f"dropout: {stop_reason}\n")
+    else:
+        f.write("dropout: none\n")
+print(f"  Session summary: {session_summary_path}")
 
 if not _HAVE_SCIPY:
     print("\n  NOTE: scipy not found — anti-alias filter skipped. "
