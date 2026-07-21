@@ -1,0 +1,4 @@
+Recording summary 2026-07-21T14:25:58.515281
+A: A1  samples=51204  fs=256
+B: 6F  samples=51204  fs=256
+dropout: none

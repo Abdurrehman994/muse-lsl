@@ -124,6 +124,17 @@ def load_csv_to_raw(csv_path, subject_label, onset_s=None):
     info = mne.create_info(ch_names=ch_names_prefixed, sfreq=fs, ch_types="eeg")
     raw = mne.io.RawArray(data, info, verbose=False)
 
+    # attach standard 10-20 electrode coordinates so MNE knows where TP9/AF7/
+    # AF8/TP10 sit on the scalp (enables spatial-color PSD plots, topomaps,
+    # and any future montage-aware steps). Renaming is needed because the
+    # montage's built-in names ("TP9") don't match our subject-prefixed ones
+    # ("A_TP9") -- MNE matches montage points to raw channels by exact name.
+    montage = mne.channels.make_standard_montage("standard_1020")
+    rename_map = {f"{subject_label}_{c}": c for c in CH_NAMES}
+    raw.rename_channels(rename_map)
+    raw.set_montage(montage, on_missing="warn", verbose=False)
+    raw.rename_channels({v: k for k, v in rename_map.items()})
+
     # annotations from is_gap column
     if "is_gap" in df.columns:
         gap = df["is_gap"].values.astype(bool)

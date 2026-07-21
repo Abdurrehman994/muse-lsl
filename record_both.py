@@ -54,6 +54,9 @@ WIN_SECONDS      = 5
 GAP_THRESHOLD_MS = 20.0
 STREAM_DROP_TIMEOUT_S = 3.0
 STREAM_DROP_GRACE_S   = 10.0
+QUALITY_CHECK_S  = 5.0
+FLAT_STD_UV      = 1.0    # below this: electrode isn't picking up real signal
+NOISY_STD_UV     = 100.0  # above this: poor contact / excessive movement
 
 # vertical offsets so channels don't overlap on the live plot
 OFFSETS = np.array([300, 200, 100, 0])
@@ -82,6 +85,54 @@ def pick_stream(streams, name, skip=0):
                 return s
             count += 1
     return None
+
+
+# ============================================================
+# Pre-recording signal-quality gate
+# ============================================================
+
+def run_quality_check(inlet_a, inlet_b, name_a, name_b, check_s=QUALITY_CHECK_S):
+    """
+    Pull a short window from both headsets and report per-channel std /
+    peak-to-peak before committing to a full recording. Flags channels that
+    are flat (no real scalp contact) or wildly noisy (poor contact /
+    movement), so a bad fit can be corrected before the real recording runs
+    instead of being discovered afterwards in pipeline.py.
+    """
+    print(f"\nChecking signal quality for {check_s:.0f}s "
+          f"(sit still, don't talk) ...")
+    buf_a, buf_b = [], []
+    t_end = local_clock() + check_s
+    while local_clock() < t_end:
+        samples, _ = inlet_a.pull_chunk(timeout=0.1)
+        if samples:
+            buf_a.extend(s[:4] for s in samples)
+        samples, _ = inlet_b.pull_chunk(timeout=0.1)
+        if samples:
+            buf_b.extend(s[:4] for s in samples)
+
+    all_ok = True
+    for label, buf in [(name_a, buf_a), (name_b, buf_b)]:
+        if len(buf) < 10:
+            print(f"  {label}: not enough samples during check — is it streaming?")
+            all_ok = False
+            continue
+        arr = np.array(buf, dtype=float)
+        print(f"  {label}:")
+        for i, ch in enumerate(CH_NAMES):
+            col = arr[:, i]
+            std = float(np.nanstd(col))
+            p2p = float(np.nanmax(col) - np.nanmin(col))
+            if std < FLAT_STD_UV:
+                flag = "FLAT — check contact / battery"
+                all_ok = False
+            elif std > NOISY_STD_UV:
+                flag = "NOISY — reseat or hold still"
+                all_ok = False
+            else:
+                flag = "ok"
+            print(f"     {ch:5s} std={std:6.1f}uV  p2p={p2p:7.1f}uV  [{flag}]")
+    return all_ok
 
 
 # ============================================================
@@ -184,7 +235,18 @@ def record_both(name_a, name_b, duration):
     fs_b = int(inlet_b.info().nominal_srate())
     print(f"\nConnected to '{stream_a.name()}' ({fs_a} Hz) as Subject A")
     print(f"Connected to '{stream_b.name()}' ({fs_b} Hz) as Subject B")
-    print(f"Recording {duration}s. Close the plot window to stop early.\n")
+
+    while True:
+        ok = run_quality_check(inlet_a, inlet_b, name_a, name_b)
+        print("\n  Signal quality: OK" if ok else
+              "\n  Signal quality: one or more channels flagged above — "
+              "reseat the headset(s) before recording.")
+        resp = input("  Press Enter to start recording, "
+                      "'r' to re-check, or Ctrl+C to abort ... ").strip().lower()
+        if resp != "r":
+            break
+
+    print(f"\nRecording {duration}s. Close the plot window to stop early.\n")
 
     # optional stimulus marker stream — checked now, and re-checked
     # throughout the whole recording in case it starts later
@@ -368,7 +430,6 @@ print(f"Make sure both muselsl streams are running:")
 print(f"  muselsl stream --address <MAC_A> --name {NAME_A}")
 print(f"  muselsl stream --address <MAC_B> --name {NAME_B}")
 print("=" * 60)
-input("Press Enter when ready to start recording ...")
 
 df_a, df_b, fs_a, fs_b, marker_events, stop_reason = record_both(NAME_A, NAME_B, DURATION)
 
