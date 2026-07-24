@@ -4,6 +4,7 @@
 recordings/*.csv
 out/
 *.log
+stimuli/checker_combined.mp4
 
 build/
 dist/

@@ -1,0 +1,27 @@
+[
+  {
+    "name": "checker_grid_6hz",
+    "start_s": 0.0,
+    "end_s": 30.0
+  },
+  {
+    "name": "checker_radial_6hz",
+    "start_s": 30.0,
+    "end_s": 90.0
+  },
+  {
+    "name": "checker_rings_6hz",
+    "start_s": 90.0,
+    "end_s": 120.0
+  },
+  {
+    "name": "checker_wedges_6hz",
+    "start_s": 120.0,
+    "end_s": 150.0
+  },
+  {
+    "name": "checker_stripes_6hz",
+    "start_s": 150.0,
+    "end_s": 180.0
+  }
+]
