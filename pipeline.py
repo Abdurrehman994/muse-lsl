@@ -33,6 +33,15 @@ Usage:
     python pipeline.py a.csv b.csv --bands alpha             # one band only
     python pipeline.py a.csv b.csv --surrogate 100           # within-dyad null (epoch shuffle)
     python pipeline.py a.csv b.csv --pool-dir recordings/other_dyads/   # cross-dyad null (pseudo-pairs)
+    python pipeline.py a.csv b.csv --stim-hz 6.0 --pool-dir recordings/other_dyads/
+        # positive control: both subjects watched the SAME 6 Hz flicker.
+        # Raw magnitude here is expected to be high but AMBIGUOUS -- see
+        # point 4 below. Needs --pool-dir (not just --surrogate) to mean
+        # anything, since a constant stimulus barely responds to epoch shuffling.
+    python pipeline.py a.csv b.csv --tag-hz-a 6.0 --tag-hz-b 8.0 --surrogate 100 --pool-dir recordings/other_dyads/
+        # frequency-tagging: A watched 6 Hz, B watched 8 Hz (two monitors,
+        # see make_checkerboard.py --pos). Unambiguous cross-brain test --
+        # see point 4 below.
 
 -----------------------------------------------------------------------------
 CHANGES IN THIS VERSION (see conversation notes / internship writeup)
@@ -77,6 +86,26 @@ CHANGES IN THIS VERSION (see conversation notes / internship writeup)
    already-filtered signal and passes filter_signal=False into HyPyP.
    This is now the default; use --no-prefilter to restore the old
    per-epoch-filtering behavior for comparison.
+
+4. FREQUENCY-TAGGING support (--tag-hz-a / --tag-hz-b).
+   Even a validated --stim-hz positive control (both subjects watching the
+   SAME flicker) is fundamentally ambiguous: elevated inter-brain PLV/circ-
+   corr there is exactly what you'd see BOTH if the two people are really
+   coupled to each other AND if they're simply two independent visual
+   systems separately locking onto one shared external clock. A shuffle
+   test can't tell these apart for a constant, non-varying stimulus (see
+   point 1), and even a --pool-dir pseudo-pair test only bounds the size of
+   the shared-clock effect -- it doesn't eliminate the ambiguity in
+   principle.
+   Frequency-tagging removes the ambiguity by construction: give subject A
+   and subject B DIFFERENT reversal rates (needs two monitors -- see --pos
+   in make_checkerboard.py). Subject B is never driven at A's frequency, so
+   any inter-brain coupling at A's tag frequency cannot be explained by "both
+   locked to the same clock" -- there was no clock at that frequency for B.
+   This is the strongest single test available and should supersede --stim-hz
+   once you have a two-monitor setup; --stim-hz remains useful only as a
+   cheap single-monitor sanity check that the measurement pipeline is
+   sensitive at all.
 -----------------------------------------------------------------------------
 """
 import argparse
@@ -684,7 +713,23 @@ def main():
                         "docstring.")
     p.add_argument("--stim-bandwidth", type=float, default=1.0,
                    help="full width in Hz of the narrow band around --stim-hz "
-                        "(default 1.0, i.e. +/-0.5 Hz)")
+                        "/ --tag-hz-a / --tag-hz-b (default 1.0, i.e. +/-0.5 Hz)")
+    p.add_argument("--tag-hz-a", type=float, default=None,
+                   help="FREQUENCY-TAGGING design: subject A's own SSVEP "
+                        "reversal rate, when A and B watched DIFFERENT "
+                        "flicker rates (needs two monitors -- see --pos in "
+                        "make_checkerboard.py). Adds a narrow inter-brain band "
+                        "at this frequency. Because B was never driven at "
+                        "A's rate, any inter-brain PLV/circ-corr here can't "
+                        "be explained by both brains locking onto one shared "
+                        "external clock -- unlike --stim-hz, where both "
+                        "subjects see the same flicker and elevated coupling "
+                        "is ambiguous between 'real interpersonal effect' and "
+                        "'two brains independently entrained to the same "
+                        "signal'. Pass --tag-hz-b too for the full design.")
+    p.add_argument("--tag-hz-b", type=float, default=None,
+                   help="FREQUENCY-TAGGING design: subject B's own SSVEP "
+                        "reversal rate. See --tag-hz-a.")
     p.add_argument("--surrogate", type=int, default=0,
                    help="number of within-dyad epoch-shuffle surrogate "
                         "permutations (0=off). Weak for continuous/stationary "
@@ -747,6 +792,39 @@ def main():
                   "--surrogate only. For a continuous/stationary flicker this "
                   "test is weak (see module docstring) -- consider also "
                   "passing --pool-dir with other subjects' recordings.")
+
+    tag_band_names = []
+    half = args.stim_bandwidth / 2
+    if args.tag_hz_a is not None:
+        tag_a_name = f"tagA_{args.tag_hz_a:g}hz"
+        freq_bands[tag_a_name] = (args.tag_hz_a - half, args.tag_hz_a + half)
+        if tag_a_name not in args.bands:
+            args.bands = list(args.bands) + [tag_a_name]
+        tag_band_names.append(tag_a_name)
+        print(f"  frequency-tagging band added: {tag_a_name} "
+              f"({freq_bands[tag_a_name][0]:.2f}-{freq_bands[tag_a_name][1]:.2f} Hz, "
+              f"subject A's own reversal rate)")
+    if args.tag_hz_b is not None:
+        tag_b_name = f"tagB_{args.tag_hz_b:g}hz"
+        freq_bands[tag_b_name] = (args.tag_hz_b - half, args.tag_hz_b + half)
+        if tag_b_name not in args.bands:
+            args.bands = list(args.bands) + [tag_b_name]
+        tag_band_names.append(tag_b_name)
+        print(f"  frequency-tagging band added: {tag_b_name} "
+              f"({freq_bands[tag_b_name][0]:.2f}-{freq_bands[tag_b_name][1]:.2f} Hz, "
+              f"subject B's own reversal rate)")
+    if tag_band_names:
+        print("  NOTE: only ONE subject was actually driven at each tag "
+              "frequency (the other's activity there is incidental), so "
+              "elevated inter-brain coupling in a tag_* band -- if it also "
+              "clears --surrogate/--pool-dir -- is not explainable by both "
+              "brains sharing one external clock, unlike --stim-hz.")
+    if args.tag_hz_a is not None and args.tag_hz_b is not None and \
+       abs(args.tag_hz_a - args.tag_hz_b) < args.stim_bandwidth:
+        print(f"  WARNING: --tag-hz-a ({args.tag_hz_a}) and --tag-hz-b "
+              f"({args.tag_hz_b}) are closer than --stim-bandwidth "
+              f"({args.stim_bandwidth}) -- their bands overlap, defeating "
+              "the point of tagging each subject at a different rate.")
 
     print("="*60)
     print("LOADING")
