@@ -12,10 +12,12 @@ Takes the two CSVs produced by record_both.py and runs the full chain:
               bandpass filter 1-40 Hz, average reference
                    |
                    v
-              fixed-length epochs (2s default), gap epochs auto-rejected
+              continuous sliding-window artifact detection (default, see
+              point 6 below) -- OR fixed-length epochs (--legacy-epochs,
+              see point 5)
                    |
                    v
-              PLV per frequency band (theta, alpha, beta) via HyPyP
+              PLV + circular correlation per frequency band (theta, alpha, beta)
                    |
                    v
               inter-brain connectivity matrices + plots
@@ -29,7 +31,8 @@ Outputs land in `out/<timestamp>/`:
 
 Usage:
     python pipeline.py <subject_a.csv> <subject_b.csv>
-    python pipeline.py a.csv b.csv --epoch-len 2.0 --epoch-overlap 0.5
+    python pipeline.py a.csv b.csv                           # default: continuous sliding-window artifact rejection (see point 6 below)
+    python pipeline.py a.csv b.csv --legacy-epochs           # old fixed-epoch pipeline (see point 5), for comparison
     python pipeline.py a.csv b.csv --bands alpha             # one band only
     python pipeline.py a.csv b.csv --surrogate 100           # within-dyad null (epoch shuffle)
     python pipeline.py a.csv b.csv --pool-dir recordings/other_dyads/   # cross-dyad null (pseudo-pairs)
@@ -106,6 +109,48 @@ CHANGES IN THIS VERSION (see conversation notes / internship writeup)
    once you have a two-monitor setup; --stim-hz remains useful only as a
    cheap single-monitor sanity check that the measurement pipeline is
    sensitive at all.
+
+5. DEFAULT EPOCH LENGTH increased from 2s to 30s (--epoch-len), overlap
+   from 1s to 0s (--epoch-overlap).
+   Short epochs inflate PLV/circ-corr: on one real dyad recording, mean
+   theta PLV dropped from 0.286 (2s epochs) to 0.131 (10s) to 0.075 (30s)
+   to 0.022 (one ~180s window covering the whole recording) -- a ~10x
+   difference in the SAME data depending only on epoch length, exactly the
+   bias reported by Zimmermann et al. (2024) and Cassioli et al. (2025),
+   who estimate ~55s (+20% for artifact loss) of clean data is needed for
+   adequately powered detection of a moderate effect at 256 Hz. 30s was
+   chosen as the new default over 55s because at 150uV amplitude
+   rejection, whole-epoch rejection makes very long epochs fragile (a
+   single blink anywhere in the window drops the whole window); 30s
+   still yields multiple epochs per session at typical recording lengths.
+   Pass --epoch-len 2.0 --epoch-overlap 1.0 to restore the old behavior.
+
+6. FIXED EPOCHS REPLACED BY CONTINUOUS SLIDING-WINDOW ARTIFACT REJECTION,
+   as the new default (--legacy-epochs restores the point-5 fixed-epoch
+   pipeline).
+   Suggested by Evan (project supervisor, 2026-07-29): even the 30s fixed
+   epochs from point 5 have the same flaw at a different scale -- a single
+   1s blink inside a 30s window throws out the OTHER 29s of perfectly good
+   data too, since MNE's epoch rejection is all-or-nothing per epoch.
+   Instead, continuous_bad_mask() slides a short window (500ms, 100ms step
+   by default -- see --artifact-window/--artifact-step/--artifact-threshold)
+   across each subject's continuous signal and marks only the actual bad
+   stretch, in BOTH subjects, at the matching timepoints (PLV/circ-corr need
+   paired samples from both brains at the same instant). The Hilbert
+   transform (instantaneous phase) is computed ONCE on the full continuous
+   band-passed recording -- so there's no splicing discontinuity anywhere --
+   and only afterward are the jointly-clean samples selected for the PLV /
+   circular-correlation sum. See plv_masked()/circ_corr_masked() and the
+   "3a2. CONTINUOUS (MASKED) CONNECTIVITY" section below; this bypasses
+   HyPyP's epoch-based API, which has no way to mask out individual
+   timepoints within an epoch. NOTE: circ_corr_masked() computes the
+   CLASSIC Fisher & Lee (1983) circular correlation coefficient, not the
+   bias-adjusted CCoradj from Zimmermann et al. (2024) that circular_corr_hypyp()
+   (legacy path) uses -- the adjusted version's exact mean-centering
+   procedure wasn't confidently reproducible from the secondary source
+   available while writing this, so the continuous path reports the
+   well-specified classic version instead of risking a mislabeled
+   approximation.
 -----------------------------------------------------------------------------
 """
 import argparse
@@ -330,6 +375,9 @@ def load_and_epoch_subject(csv_path, subject_label, epoch_len_s, overlap_s,
     AND for any --pool-dir subjects used in pseudo-pair validation (they all
     need to go through identical preprocessing to be a fair comparison).
 
+    Legacy path (--legacy-epochs) only -- see load_and_preprocess_continuous
+    for the default, continuous artifact-rejection path.
+
     Returns (epochs, fs) or (None, None) if the file couldn't be used.
     """
     try:
@@ -350,6 +398,82 @@ def load_and_epoch_subject(csv_path, subject_label, epoch_len_s, overlap_s,
             print(f"  WARNING: {csv_path} produced 0 usable epochs — skipping")
         return None, fs
     return epochs, fs
+
+
+# ============================================================
+# 2b. CONTINUOUS ARTIFACT DETECTION (default path, no fixed epochs)
+# ============================================================
+#
+# Suggested by Evan (project supervisor, 2026-07-29): fixed-length epochs
+# (even the 30s ones from the previous fix) get thrown out ENTIRELY if even
+# a small fraction is bad -- e.g. 1s of blink inside a 30s window discards
+# 29s of perfectly good data. A short sliding window instead marks and
+# removes only the actual bad stretch, in BOTH subjects at the matching
+# timepoints (since PLV/circ-corr need paired samples from both brains at
+# the same instant), and the connectivity stats run on whatever continuous
+# good data is left -- no arbitrary epoch boundaries at all.
+
+def continuous_bad_mask(raw, window_s=0.5, step_s=0.1, threshold_uv=500.0):
+    """
+    Slide a window across a subject's continuous signal; mark every sample
+    covered by a window as bad if any channel's peak-to-peak amplitude in
+    that window exceeds threshold_uv. Also folds in existing BAD_gap
+    annotations (lost BLE packets), so both artifact types end up in one
+    boolean mask over samples.
+    """
+    data_uv = raw.get_data(picks="eeg") * 1e6
+    sfreq = raw.info["sfreq"]
+    n_samples = data_uv.shape[1]
+    window_n = max(1, int(round(window_s * sfreq)))
+    step_n = max(1, int(round(step_s * sfreq)))
+
+    bad = np.zeros(n_samples, dtype=bool)
+    starts = list(range(0, max(1, n_samples - window_n + 1), step_n))
+    last_start = max(0, n_samples - window_n)
+    if not starts or starts[-1] != last_start:
+        starts.append(last_start)
+    for start in starts:
+        end = min(start + window_n, n_samples)
+        seg = data_uv[:, start:end]
+        ptp = seg.max(axis=1) - seg.min(axis=1)
+        if np.any(ptp > threshold_uv):
+            bad[start:end] = True
+
+    for ann in raw.annotations:
+        if "BAD" in ann["description"]:
+            onset_samp = int(round(ann["onset"] * sfreq))
+            dur_samp = int(round(ann["duration"] * sfreq))
+            bad[max(0, onset_samp):max(0, onset_samp) + dur_samp] = True
+
+    return bad
+
+
+def load_and_preprocess_continuous(csv_path, subject_label, h_freq=40.0,
+                                    use_ica=False, align_onset=True, quiet=False,
+                                    artifact_window=0.5, artifact_step=0.1,
+                                    artifact_threshold=500.0):
+    """
+    Full load -> preprocess chain for ONE subject's CSV, for the default
+    continuous (non-epoched) connectivity path.
+
+    Returns (raw_pp, bad_mask, fs) or (None, None, None) if the file
+    couldn't be used.
+    """
+    try:
+        onset = load_stimulus_onset(csv_path) if align_onset else None
+        raw, fs = load_csv_to_raw(csv_path, subject_label, onset_s=onset)
+    except Exception as e:
+        if not quiet:
+            print(f"  WARNING: could not load {csv_path}: {e}")
+        return None, None, None
+
+    nyq = fs / 2
+    h_freq_eff = min(h_freq, nyq * 0.95)
+    raw_pp = preprocess(raw, h_freq=h_freq_eff, use_ica=use_ica, subject_label=subject_label)
+    bad_mask = continuous_bad_mask(raw_pp, window_s=artifact_window,
+                                    step_s=artifact_step,
+                                    threshold_uv=artifact_threshold)
+    return raw_pp, bad_mask, fs
 
 
 # ============================================================
@@ -528,6 +652,121 @@ def pseudo_pair_distribution(target_epochs, pool_epochs_list, band, metric_fn, s
 
 
 # ============================================================
+# 3a2. CONTINUOUS (MASKED) CONNECTIVITY -- default path, no fixed epochs
+# ============================================================
+#
+# Companion to section 2b: instead of chopping the recording into fixed
+# epochs and rejecting whole ones, the Hilbert transform is computed ONCE
+# on the FULL continuous band-passed recording (so there's no splicing
+# discontinuity anywhere), and only afterward do we select just the
+# samples that are clean in BOTH subjects for the actual PLV / circular
+# correlation sum. This bypasses HyPyP's epoch-based API (which has no way
+# to mask out individual timepoints within an epoch), so PLV and the
+# circular correlation coefficient are computed directly here instead.
+#
+# NOTE on circ-corr: this computes the CLASSIC Fisher & Lee (1983) circular
+# correlation coefficient, not the bias-adjusted CCoradj from Zimmermann
+# et al. (2024) used in the legacy (--legacy-epochs) path via HyPyP's
+# 'accorr' mode -- the adjusted version's exact mean-centering procedure
+# wasn't confidently reproducible from the secondary source available while
+# writing this, so this path reports the well-specified classic version
+# instead rather than risk mislabeling an approximation as the adjusted one.
+
+def analytic_signal(raw_band, n_samples=None):
+    """Hilbert transform of a band-passed CONTINUOUS Raw -> complex analytic
+    signal per channel, shape (n_channels, n_times)."""
+    from scipy.signal import hilbert
+    data = raw_band.get_data(picks="eeg")
+    if n_samples is not None:
+        data = data[:, :n_samples]
+    return hilbert(data, axis=-1)
+
+
+def plv_masked(analytic_a, analytic_b, good_mask):
+    """PLV between every channel pair, summed over good_mask samples only.
+    Returns (n_chan_a, n_chan_b)."""
+    phase_a = np.angle(analytic_a[:, good_mask])
+    phase_b = np.angle(analytic_b[:, good_mask])
+    diff = phase_a[:, None, :] - phase_b[None, :, :]
+    return np.abs(np.mean(np.exp(1j * diff), axis=-1))
+
+
+def circ_corr_masked(analytic_a, analytic_b, good_mask):
+    """Classic Fisher & Lee (1983) circular correlation coefficient between
+    every channel pair, summed over good_mask samples only. Signed:
+    positive = in-phase-leaning, negative = anti-phase-leaning. Returns
+    (n_chan_a, n_chan_b)."""
+    phase_a = np.angle(analytic_a[:, good_mask])
+    phase_b = np.angle(analytic_b[:, good_mask])
+    mean_a = np.angle(np.mean(np.exp(1j * phase_a), axis=-1))
+    mean_b = np.angle(np.mean(np.exp(1j * phase_b), axis=-1))
+    sin_a = np.sin(phase_a - mean_a[:, None])
+    sin_b = np.sin(phase_b - mean_b[:, None])
+    num = np.einsum("it,jt->ij", sin_a, sin_b)
+    den = np.sqrt(np.sum(sin_a ** 2, axis=-1)[:, None] * np.sum(sin_b ** 2, axis=-1)[None, :])
+    return num / den
+
+
+def circular_shift_surrogates_continuous(analytic_a, bad_a, analytic_b, bad_b,
+                                          n_surrogates, metric_fn, seed=0):
+    """
+    WITHIN-DYAD null for the continuous path: circularly time-shift subject
+    B's ENTIRE analytic signal (and its own bad-mask) by a random amount,
+    wrapping at the recording boundary, then recompute the joint good_mask
+    against A's (unshifted) bad-mask. This is the standard continuous-
+    signal surrogate method -- it preserves each subject's own temporal/
+    spectral structure while destroying true moment-to-moment alignment
+    between the two brains, playing the same role the old epoch-shuffle
+    surrogate did before fixed epochs were removed.
+    """
+    rng = np.random.default_rng(seed)
+    n = analytic_b.shape[-1]
+    nulls = []
+    for _ in range(n_surrogates):
+        shift = int(rng.integers(1, n))
+        b_shifted = np.roll(analytic_b, shift, axis=-1)
+        bad_b_shifted = np.roll(bad_b, shift)
+        good = ~(bad_a | bad_b_shifted)
+        if good.sum() == 0:
+            continue
+        nulls.append(metric_fn(analytic_a, b_shifted, good))
+    return np.array(nulls) if nulls else None
+
+
+def pseudo_pair_continuous(target_analytic, target_bad, pool_analytic_list, pool_bad_list,
+                            metric_fn, shuffles_per_pool_member=3, seed=0):
+    """
+    CROSS-DYAD null for the continuous path: compare the target subject's
+    continuous analytic signal against OTHER subjects' (--pool-dir)
+    continuous analytic signal, at randomly shifted alignments, keeping
+    only jointly-clean samples. See pseudo_pair_distribution() (legacy
+    epoch-based version) for the rationale.
+
+    Returns array shape (n_pool * shuffles_per_pool_member, n_chan, n_chan)
+    or None if no pool member overlapped with clean data.
+    """
+    rng = np.random.default_rng(seed)
+    nulls = []
+    for pool_analytic, pool_bad in zip(pool_analytic_list, pool_bad_list):
+        n = min(target_analytic.shape[-1], pool_analytic.shape[-1])
+        if n == 0:
+            continue
+        t_analytic = target_analytic[:, :n]
+        t_bad = target_bad[:n]
+        for _ in range(shuffles_per_pool_member):
+            shift = int(rng.integers(0, pool_analytic.shape[-1]))
+            p_analytic = np.roll(pool_analytic, shift, axis=-1)[:, :n]
+            p_bad = np.roll(pool_bad, shift)[:n]
+            good = ~(t_bad | p_bad)
+            if good.sum() == 0:
+                continue
+            nulls.append(metric_fn(t_analytic, p_analytic, good))
+    if not nulls:
+        return None
+    return np.array(nulls)
+
+
+# ============================================================
 # 3b. MULTIPLE-COMPARISONS CORRECTION
 # ============================================================
 
@@ -697,10 +936,46 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("csv_a")
     p.add_argument("csv_b")
-    p.add_argument("--epoch-len", type=float, default=2.0,
-                   help="epoch length in seconds (default 2.0)")
-    p.add_argument("--epoch-overlap", type=float, default=1.0,
-                   help="epoch overlap in seconds (default 1.0)")
+    p.add_argument("--legacy-epochs", action="store_true",
+                   help="use the OLD fixed-length-epoch pipeline (see "
+                        "--epoch-len/--epoch-overlap/--amplitude-threshold "
+                        "below) instead of the default continuous sliding-"
+                        "window artifact rejection (see --artifact-window/"
+                        "--artifact-step/--artifact-threshold). Fixed epochs "
+                        "throw out the WHOLE epoch if even a small fraction "
+                        "is bad (e.g. 1s of blink inside a 30s window wastes "
+                        "29s of good data) -- kept only for reproducing/"
+                        "comparing against older runs.")
+    p.add_argument("--artifact-window", type=float, default=0.5,
+                   help="(continuous/default path only) sliding window "
+                        "length in seconds for artifact detection (default "
+                        "0.5). A window is marked bad if any channel's "
+                        "peak-to-peak amplitude inside it exceeds "
+                        "--artifact-threshold.")
+    p.add_argument("--artifact-step", type=float, default=0.1,
+                   help="(continuous/default path only) step size in "
+                        "seconds between sliding artifact-detection windows "
+                        "(default 0.1).")
+    p.add_argument("--artifact-threshold", type=float, default=500.0,
+                   help="(continuous/default path only) peak-to-peak "
+                        "amplitude threshold in uV for the sliding-window "
+                        "artifact detector (default 500).")
+    p.add_argument("--epoch-len", type=float, default=30.0,
+                   help="(--legacy-epochs only) epoch length in seconds "
+                        "(default 30.0). Short epochs (e.g. 2s) inflate "
+                        "PLV/circ-corr -- Zimmermann et al. (2024) and "
+                        "Cassioli et al. (2025) report values stabilize "
+                        "only past ~5-6s, with ~55s (+20%% for artifact "
+                        "loss) needed for adequately powered detection of a "
+                        "moderate effect at 256 Hz. Use --epoch-len 2.0 to "
+                        "reproduce the old (inflated) behaviour for "
+                        "comparison.")
+    p.add_argument("--epoch-overlap", type=float, default=0.0,
+                   help="(--legacy-epochs only) epoch overlap in seconds "
+                        "(default 0.0, i.e. non-overlapping). Overlapping "
+                        "long epochs share most of their data and are not "
+                        "independent samples for epoch-averaging or "
+                        "surrogate shuffling.")
     p.add_argument("--bands", nargs="+", default=list(FREQ_BANDS.keys()),
                    help="which bands to compute (theta alpha beta)")
     p.add_argument("--stim-hz", type=float, default=None,
@@ -743,32 +1018,38 @@ def main():
                    help="random epoch-order draws per pool member when "
                         "building the pseudo-pair null (default 3)")
     p.add_argument("--pool-amplitude-threshold", type=float, default=None,
-                   help="peak-to-peak amplitude threshold (uV) applied when "
-                        "epoching --pool-dir recordings, separate from "
-                        "--amplitude-threshold. Defaults to whatever "
-                        "--amplitude-threshold is. Pool recordings often come "
-                        "from unrelated sessions with different noise levels "
-                        "(e.g. a hardware test recording) -- loosen this (or "
-                        "pass 0 to disable) if they get rejected wholesale "
-                        "under the main dyad's threshold.")
+                   help="(--legacy-epochs only) peak-to-peak amplitude "
+                        "threshold (uV) applied when epoching --pool-dir "
+                        "recordings, separate from --amplitude-threshold. "
+                        "Defaults to whatever --amplitude-threshold is. Pool "
+                        "recordings often come from unrelated sessions with "
+                        "different noise levels (e.g. a hardware test "
+                        "recording) -- loosen this (or pass 0 to disable) "
+                        "if they get rejected wholesale under the main "
+                        "dyad's threshold.")
     p.add_argument("--correction", choices=["fdr", "none"], default="fdr",
                    help="multiple-comparisons correction across the 16 "
                         "channel pairs per band (default fdr). 'none' "
                         "restores the old raw p<0.05 counting.")
     p.add_argument("--amplitude-threshold", type=float, default=150.0,
-                   help="peak-to-peak amplitude threshold in µV for epoch rejection "
-                        "(default 150). Lower = stricter. 0 = disabled.")
+                   help="(--legacy-epochs only) peak-to-peak amplitude "
+                        "threshold in µV for epoch rejection (default 150). "
+                        "Lower = stricter. 0 = disabled.")
     p.add_argument("--ica", action="store_true",
                    help="remove the single most blink-correlated ICA component per "
                         "subject before referencing (experimental — only 4 channels "
                         "available, so separation is weak)")
     p.add_argument("--prefilter", dest="prefilter", action="store_true", default=True,
-                   help="band-pass the CONTINUOUS raw signal into each band "
-                        "before epoching, instead of filtering each short "
-                        "epoch independently inside HyPyP (default: on). "
-                        "Reduces filter edge/transient bias for narrow bands.")
+                   help="(--legacy-epochs only; the continuous/default path "
+                        "always band-passes the continuous signal before the "
+                        "Hilbert transform, since that step is required, not "
+                        "optional, there) band-pass the CONTINUOUS raw "
+                        "signal into each band before epoching, instead of "
+                        "filtering each short epoch independently inside "
+                        "HyPyP (default: on). Reduces filter edge/transient "
+                        "bias for narrow bands.")
     p.add_argument("--no-prefilter", dest="prefilter", action="store_false",
-                   help="disable --prefilter and restore old per-epoch "
+                   help="(--legacy-epochs only) disable --prefilter and restore old per-epoch "
                         "narrowband filtering inside HyPyP (for comparison).")
     p.add_argument("--out-dir", default=None)
     args = p.parse_args()
@@ -861,51 +1142,87 @@ def main():
     plot_raw_with_gaps(raw_a_pp, raw_b_pp, os.path.join(out_dir, "raw_with_gaps.png"))
     plot_psd(raw_a_pp, raw_b_pp, os.path.join(out_dir, "psd.png"))
 
-    print()
-    print("="*60)
-    print("EPOCHING")
-    print("="*60)
-    amp_thresh = args.amplitude_threshold if args.amplitude_threshold > 0 else None
-    thresh_str = f"{amp_thresh} µV" if amp_thresh else "disabled"
-    print(f"  epoch_len={args.epoch_len}s  overlap={args.epoch_overlap}s  "
-          f"amplitude_threshold={thresh_str}")
-    epochs_a = epoch_with_gap_rejection(raw_a_pp, args.epoch_len, args.epoch_overlap,
-                                        amplitude_uv=amp_thresh or 1e9)
-    epochs_b = epoch_with_gap_rejection(raw_b_pp, args.epoch_len, args.epoch_overlap,
-                                        amplitude_uv=amp_thresh or 1e9)
-    print(f"  Subject A: {len(epochs_a)} epochs survived (out of "
-          f"{len(epochs_a.drop_log)} attempted)")
-    print(f"  Subject B: {len(epochs_b)} epochs survived (out of "
-          f"{len(epochs_b.drop_log)} attempted)")
+    epochs_a = epochs_b = None
+    n_ep = None
+    bad_a = bad_b = good_mask = None
+    n_common = None
 
-    if len(epochs_a) == 0 or len(epochs_b) == 0:
+    if args.legacy_epochs:
         print()
-        print("  No surviving epochs. The recording is too gappy for this "
-              "epoch length.")
-        print("  Try:  --epoch-len 1.0 --epoch-overlap 0.5")
-        print("  Or: get cleaner data (single-BT-adapter problem).")
-        sys.exit(0)
+        print("="*60)
+        print("EPOCHING (legacy fixed-length epochs, --legacy-epochs)")
+        print("="*60)
+        amp_thresh = args.amplitude_threshold if args.amplitude_threshold > 0 else None
+        thresh_str = f"{amp_thresh} µV" if amp_thresh else "disabled"
+        print(f"  epoch_len={args.epoch_len}s  overlap={args.epoch_overlap}s  "
+              f"amplitude_threshold={thresh_str}")
+        epochs_a = epoch_with_gap_rejection(raw_a_pp, args.epoch_len, args.epoch_overlap,
+                                            amplitude_uv=amp_thresh or 1e9)
+        epochs_b = epoch_with_gap_rejection(raw_b_pp, args.epoch_len, args.epoch_overlap,
+                                            amplitude_uv=amp_thresh or 1e9)
+        print(f"  Subject A: {len(epochs_a)} epochs survived (out of "
+              f"{len(epochs_a.drop_log)} attempted)")
+        print(f"  Subject B: {len(epochs_b)} epochs survived (out of "
+              f"{len(epochs_b.drop_log)} attempted)")
 
-    # Match epochs by original time-slot index, not by position in each
-    # subject's own surviving list. A and B reject different epochs (whichever
-    # overlap THEIR OWN gaps/artifacts), so truncating by position pairs
-    # epochs from different real-world moments -- e.g. A's epoch #5 (its 5th
-    # survivor) might be B's epoch #9 in time, growing worse the more the two
-    # subjects' rejections diverge. Keep only slots that survived in both.
-    common = np.intersect1d(epochs_a.selection, epochs_b.selection)
-    epochs_a = epochs_a[np.isin(epochs_a.selection, common)]
-    epochs_b = epochs_b[np.isin(epochs_b.selection, common)]
-    n_ep = len(common)
-    print(f"  Using {n_ep} time-aligned matched epochs for connectivity "
-          f"(kept only time slots that survived rejection in both subjects).")
+        if len(epochs_a) == 0 or len(epochs_b) == 0:
+            print()
+            print("  No surviving epochs. The recording is too gappy for this "
+                  "epoch length.")
+            print("  Try:  --epoch-len 1.0 --epoch-overlap 0.5")
+            print("  Or: get cleaner data (single-BT-adapter problem).")
+            sys.exit(0)
+
+        # Match epochs by original time-slot index, not by position in each
+        # subject's own surviving list. A and B reject different epochs (whichever
+        # overlap THEIR OWN gaps/artifacts), so truncating by position pairs
+        # epochs from different real-world moments -- e.g. A's epoch #5 (its 5th
+        # survivor) might be B's epoch #9 in time, growing worse the more the two
+        # subjects' rejections diverge. Keep only slots that survived in both.
+        common = np.intersect1d(epochs_a.selection, epochs_b.selection)
+        epochs_a = epochs_a[np.isin(epochs_a.selection, common)]
+        epochs_b = epochs_b[np.isin(epochs_b.selection, common)]
+        n_ep = len(common)
+        print(f"  Using {n_ep} time-aligned matched epochs for connectivity "
+              f"(kept only time slots that survived rejection in both subjects).")
+    else:
+        print()
+        print("="*60)
+        print("CONTINUOUS ARTIFACT DETECTION (default; see --legacy-epochs "
+              "for the old fixed-epoch path)")
+        print("="*60)
+        print(f"  sliding window={args.artifact_window}s  step={args.artifact_step}s  "
+              f"threshold={args.artifact_threshold} uV")
+        bad_a = continuous_bad_mask(raw_a_pp, window_s=args.artifact_window,
+                                     step_s=args.artifact_step,
+                                     threshold_uv=args.artifact_threshold)
+        bad_b = continuous_bad_mask(raw_b_pp, window_s=args.artifact_window,
+                                     step_s=args.artifact_step,
+                                     threshold_uv=args.artifact_threshold)
+        n_common = min(len(bad_a), len(bad_b))
+        bad_a = bad_a[:n_common]
+        bad_b = bad_b[:n_common]
+        good_mask = ~(bad_a | bad_b)
+        total_s = n_common / fs_a
+        good_s = good_mask.sum() / fs_a
+        print(f"  Subject A: {100 * (~bad_a).mean():.1f}% clean")
+        print(f"  Subject B: {100 * (~bad_b).mean():.1f}% clean")
+        print(f"  Jointly clean (usable for connectivity): {good_s:.1f}s / "
+              f"{total_s:.1f}s ({100 * good_mask.mean():.1f}%)")
+
+        if good_mask.sum() == 0:
+            print()
+            print("  No jointly-clean samples survive. Try loosening "
+                  "--artifact-threshold, or check hardware/fit.")
+            sys.exit(0)
 
     # ------------------------------------------------------------------
     # Optionally load a pool of OTHER subjects' recordings for pseudo-pair
     # (cross-dyad) validation. Each pool file goes through the SAME load ->
-    # preprocess -> epoch chain as the two main subjects, so the comparison
-    # is fair.
+    # preprocess chain as the two main subjects, so the comparison is fair.
     # ------------------------------------------------------------------
     pool_epochs = []
+    pool_data = []  # continuous mode: list of (raw_pp, bad_mask)
     if args.pool_dir:
         print()
         print("="*60)
@@ -926,33 +1243,56 @@ def main():
                                if args.pool_amplitude_threshold is not None
                                else args.amplitude_threshold)
         pool_amp_thresh = pool_amp_thresh_arg if pool_amp_thresh_arg > 0 else None
-        print(f"  pool amplitude_threshold={pool_amp_thresh or 'disabled'} µV "
-              f"{'(same as main dyad)' if args.pool_amplitude_threshold is None else '(override)'}")
-        for f in pool_files:
-            ep, fs_pool = load_and_epoch_subject(
-                f, subject_label=f"POOL_{os.path.basename(f)}",
-                epoch_len_s=args.epoch_len, overlap_s=args.epoch_overlap,
-                h_freq=h_freq, amplitude_uv=pool_amp_thresh or 1e9,
-                use_ica=args.ica, align_onset=True, quiet=False,
-            )
-            if ep is not None and fs_pool == fs_a:
-                pool_epochs.append(ep)
-            elif ep is not None:
-                print(f"  WARNING: {f} has fs={fs_pool} != {fs_a}, skipping "
-                      "(sampling rate must match for pooling)")
-        print(f"  Pool ready: {len(pool_epochs)} usable recordings "
-              f"(from {len(pool_files)} files found)")
+
+        if args.legacy_epochs:
+            print(f"  pool amplitude_threshold={pool_amp_thresh or 'disabled'} µV "
+                  f"{'(same as main dyad)' if args.pool_amplitude_threshold is None else '(override)'}")
+            for f in pool_files:
+                ep, fs_pool = load_and_epoch_subject(
+                    f, subject_label=f"POOL_{os.path.basename(f)}",
+                    epoch_len_s=args.epoch_len, overlap_s=args.epoch_overlap,
+                    h_freq=h_freq, amplitude_uv=pool_amp_thresh or 1e9,
+                    use_ica=args.ica, align_onset=True, quiet=False,
+                )
+                if ep is not None and fs_pool == fs_a:
+                    pool_epochs.append(ep)
+                elif ep is not None:
+                    print(f"  WARNING: {f} has fs={fs_pool} != {fs_a}, skipping "
+                          "(sampling rate must match for pooling)")
+            print(f"  Pool ready: {len(pool_epochs)} usable recordings "
+                  f"(from {len(pool_files)} files found)")
+        else:
+            for f in pool_files:
+                raw_pool, bad_pool, fs_pool = load_and_preprocess_continuous(
+                    f, subject_label=f"POOL_{os.path.basename(f)}",
+                    h_freq=h_freq, use_ica=args.ica, align_onset=True, quiet=False,
+                    artifact_window=args.artifact_window,
+                    artifact_step=args.artifact_step,
+                    artifact_threshold=args.artifact_threshold,
+                )
+                if raw_pool is not None and fs_pool == fs_a:
+                    pool_data.append((raw_pool, bad_pool))
+                elif raw_pool is not None:
+                    print(f"  WARNING: {f} has fs={fs_pool} != {fs_a}, skipping "
+                          "(sampling rate must match for pooling)")
+            print(f"  Pool ready: {len(pool_data)} usable recordings "
+                  f"(from {len(pool_files)} files found)")
 
     print()
     print("="*60)
     print("PLV + CIRCULAR CORRELATION PER BAND")
     print("="*60)
-    if args.prefilter:
-        print("  --prefilter is ON: continuous raw is band-passed BEFORE "
-              "epoching for each band (reduces per-epoch filter edge bias).")
+    if args.legacy_epochs:
+        if args.prefilter:
+            print("  --prefilter is ON: continuous raw is band-passed BEFORE "
+                  "epoching for each band (reduces per-epoch filter edge bias).")
+        else:
+            print("  --prefilter is OFF: each short epoch is narrowband-filtered "
+                  "independently inside HyPyP (legacy behaviour).")
     else:
-        print("  --prefilter is OFF: each short epoch is narrowband-filtered "
-              "independently inside HyPyP (legacy behaviour).")
+        print("  continuous path: band-passing + Hilbert transform run on the "
+              "full recording per band, then only jointly-clean samples "
+              "(good_mask) are used for the PLV/circ-corr sum.")
 
     plvs = {}
     ccs = {}
@@ -963,8 +1303,17 @@ def main():
     summary_lines = [f"Hyperscanning summary  {datetime.now().isoformat()}"]
     summary_lines.append(f"  A: {args.csv_a}")
     summary_lines.append(f"  B: {args.csv_b}")
-    summary_lines.append(f"  fs={fs_a:.0f} Hz, epochs={n_ep}, "
-                         f"epoch_len={args.epoch_len}s")
+    if args.legacy_epochs:
+        summary_lines.append(f"  fs={fs_a:.0f} Hz, epochs={n_ep}, "
+                             f"epoch_len={args.epoch_len}s")
+    else:
+        summary_lines.append(
+            f"  fs={fs_a:.0f} Hz, continuous artifact rejection "
+            f"(window={args.artifact_window}s step={args.artifact_step}s "
+            f"threshold={args.artifact_threshold}uV), "
+            f"{good_mask.sum() / fs_a:.1f}s/{n_common / fs_a:.1f}s usable "
+            f"({100 * good_mask.mean():.1f}%)"
+        )
     summary_lines.append(f"  prefilter={args.prefilter}  "
                          f"correction={args.correction}  "
                          f"pool_dir={args.pool_dir or '(none)'}")
@@ -980,31 +1329,97 @@ def main():
                   f"above Nyquist ({nyq:.1f} Hz)")
             continue
 
-        # -- build (possibly pre-filtered) epochs for THIS band --------
-        if args.prefilter:
+        if args.legacy_epochs:
+            # -- build (possibly pre-filtered) epochs for THIS band --------
+            if args.prefilter:
+                raw_a_band = prefilter_raw_for_band(raw_a_pp, band)
+                raw_b_band = prefilter_raw_for_band(raw_b_pp, band)
+                epochs_a_band = epoch_with_gap_rejection(
+                    raw_a_band, args.epoch_len, args.epoch_overlap,
+                    amplitude_uv=amp_thresh or 1e9)
+                epochs_b_band = epoch_with_gap_rejection(
+                    raw_b_band, args.epoch_len, args.epoch_overlap,
+                    amplitude_uv=amp_thresh or 1e9)
+                common_band = np.intersect1d(epochs_a_band.selection, epochs_b_band.selection)
+                epochs_a_band = epochs_a_band[np.isin(epochs_a_band.selection, common_band)]
+                epochs_b_band = epochs_b_band[np.isin(epochs_b_band.selection, common_band)]
+                already_filtered = True
+            else:
+                epochs_a_band, epochs_b_band = epochs_a, epochs_b
+                already_filtered = False
+
+            if len(epochs_a_band) == 0 or len(epochs_b_band) == 0:
+                print(f"  {band_name}: 0 epochs survive after band-specific "
+                      "filtering/rejection — skipping")
+                continue
+
+            plv = plv_hypyp(epochs_a_band, epochs_b_band, band, fs_a,
+                             already_filtered=already_filtered)
+            cc = circular_corr_hypyp(epochs_a_band, epochs_b_band, band, fs_a,
+                                      already_filtered=already_filtered)
+
+            def compute_within_null(n_surr, _epochs_a_band=epochs_a_band,
+                                     _epochs_b_band=epochs_b_band, _band=band,
+                                     _already_filtered=already_filtered):
+                null_plv = surrogate_distribution(
+                    _epochs_a_band, _epochs_b_band, _band, n_surr,
+                    metric_fn=plv_hypyp, sfreq=fs_a, already_filtered=_already_filtered)
+                null_cc = surrogate_distribution(
+                    _epochs_a_band, _epochs_b_band, _band, n_surr,
+                    metric_fn=circular_corr_hypyp, sfreq=fs_a, already_filtered=_already_filtered)
+                return null_plv, null_cc
+
+            def compute_pool_null(_epochs_a_band=epochs_a_band, _epochs_b_band=epochs_b_band,
+                                   _band=band, _already_filtered=already_filtered):
+                null_plv_pool = []
+                for target in (_epochs_a_band, _epochs_b_band):
+                    res = pseudo_pair_distribution(
+                        target, pool_epochs, _band, plv_hypyp, sfreq=fs_a,
+                        already_filtered=_already_filtered,
+                        shuffles_per_pool_member=args.pool_shuffles)
+                    if res is not None:
+                        null_plv_pool.append(res)
+                return np.concatenate(null_plv_pool, axis=0) if null_plv_pool else None
+
+            have_pool = bool(pool_epochs)
+        else:
             raw_a_band = prefilter_raw_for_band(raw_a_pp, band)
             raw_b_band = prefilter_raw_for_band(raw_b_pp, band)
-            epochs_a_band = epoch_with_gap_rejection(
-                raw_a_band, args.epoch_len, args.epoch_overlap,
-                amplitude_uv=amp_thresh or 1e9)
-            epochs_b_band = epoch_with_gap_rejection(
-                raw_b_band, args.epoch_len, args.epoch_overlap,
-                amplitude_uv=amp_thresh or 1e9)
-            common_band = np.intersect1d(epochs_a_band.selection, epochs_b_band.selection)
-            epochs_a_band = epochs_a_band[np.isin(epochs_a_band.selection, common_band)]
-            epochs_b_band = epochs_b_band[np.isin(epochs_b_band.selection, common_band)]
-            already_filtered = True
-        else:
-            epochs_a_band, epochs_b_band = epochs_a, epochs_b
-            already_filtered = False
+            analytic_a = analytic_signal(raw_a_band, n_samples=n_common)
+            analytic_b = analytic_signal(raw_b_band, n_samples=n_common)
 
-        if len(epochs_a_band) == 0 or len(epochs_b_band) == 0:
-            print(f"  {band_name}: 0 epochs survive after band-specific "
-                  "filtering/rejection — skipping")
-            continue
+            plv = plv_masked(analytic_a, analytic_b, good_mask)
+            cc = circ_corr_masked(analytic_a, analytic_b, good_mask)
 
-        plv = plv_hypyp(epochs_a_band, epochs_b_band, band, fs_a,
-                         already_filtered=already_filtered)
+            def compute_within_null(n_surr, _analytic_a=analytic_a, _analytic_b=analytic_b,
+                                     _bad_a=bad_a, _bad_b=bad_b):
+                null_plv = circular_shift_surrogates_continuous(
+                    _analytic_a, _bad_a, _analytic_b, _bad_b, n_surr, plv_masked)
+                null_cc = circular_shift_surrogates_continuous(
+                    _analytic_a, _bad_a, _analytic_b, _bad_b, n_surr, circ_corr_masked)
+                return null_plv, null_cc
+
+            def compute_pool_null(_analytic_a=analytic_a, _analytic_b=analytic_b,
+                                   _bad_a=bad_a, _bad_b=bad_b, _band=band):
+                if not pool_data:
+                    return None
+                pool_analytic_list = []
+                pool_bad_list = []
+                for raw_pool, bad_pool in pool_data:
+                    raw_pool_band = prefilter_raw_for_band(raw_pool, _band)
+                    pool_analytic_list.append(analytic_signal(raw_pool_band))
+                    pool_bad_list.append(bad_pool)
+                null_plv_pool = []
+                for target_analytic, target_bad in ((_analytic_a, _bad_a), (_analytic_b, _bad_b)):
+                    res = pseudo_pair_continuous(
+                        target_analytic, target_bad, pool_analytic_list, pool_bad_list,
+                        plv_masked, shuffles_per_pool_member=args.pool_shuffles)
+                    if res is not None:
+                        null_plv_pool.append(res)
+                return np.concatenate(null_plv_pool, axis=0) if null_plv_pool else None
+
+            have_pool = bool(pool_data)
+
         plvs[band_name] = plv
         line = (f"  {band_name:6s} ({band[0]:4.1f}-{band[1]:4.1f} Hz): "
                 f"mean PLV = {plv.mean():.3f}  max = {plv.max():.3f}")
@@ -1012,8 +1427,6 @@ def main():
         summary_lines.append(line)
         np.save(os.path.join(out_dir, f"plv_{band_name}.npy"), plv)
 
-        cc = circular_corr_hypyp(epochs_a_band, epochs_b_band, band, fs_a,
-                                  already_filtered=already_filtered)
         ccs[band_name] = cc
         line = (f"  {band_name:6s} ({band[0]:4.1f}-{band[1]:4.1f} Hz): "
                 f"mean circ-r = {cc.mean():.3f}  min = {cc.min():.3f}  max = {cc.max():.3f}")
@@ -1023,19 +1436,12 @@ def main():
 
         # ---------------- WITHIN-DYAD surrogate (optional) -------------
         if args.surrogate > 0:
-            print(f"     running {args.surrogate} within-dyad surrogates (PLV)...")
-            null_plv = surrogate_distribution(
-                epochs_a_band, epochs_b_band, band, args.surrogate,
-                metric_fn=plv_hypyp, sfreq=fs_a, already_filtered=already_filtered,
-            )
+            print(f"     running {args.surrogate} within-dyad surrogates "
+                  f"(PLV + circ-corr)...")
+            null_plv, null_cc = compute_within_null(args.surrogate)
             p_val = (null_plv >= plv[None, :, :]).mean(axis=0)
             p_values[band_name] = p_val
 
-            print(f"     running {args.surrogate} within-dyad surrogates (circ-corr)...")
-            null_cc = surrogate_distribution(
-                epochs_a_band, epochs_b_band, band, args.surrogate,
-                metric_fn=circular_corr_hypyp, sfreq=fs_a, already_filtered=already_filtered,
-            )
             cc_p_val = (np.abs(null_cc) >= np.abs(cc[None, :, :])).mean(axis=0)
             cc_p_values[band_name] = cc_p_val
 
@@ -1070,21 +1476,12 @@ def main():
             np.save(os.path.join(out_dir, f"circ_corr_p_within_{band_name}.npy"), cc_p_val)
 
         # ---------------- CROSS-DYAD pseudo-pair null (preferred) ------
-        if pool_epochs:
-            print(f"     running pseudo-pair null against {len(pool_epochs)} "
+        if have_pool:
+            n_pool = len(pool_epochs) if args.legacy_epochs else len(pool_data)
+            print(f"     running pseudo-pair null against {n_pool} "
                   f"pool recordings x{args.pool_shuffles} draws (PLV)...")
-            # combine "A vs pool" and "B vs pool" for a fuller null
-            null_plv_pool = []
-            for target in (epochs_a_band, epochs_b_band):
-                res = pseudo_pair_distribution(
-                    target, pool_epochs, band, plv_hypyp, sfreq=fs_a,
-                    already_filtered=already_filtered,
-                    shuffles_per_pool_member=args.pool_shuffles,
-                )
-                if res is not None:
-                    null_plv_pool.append(res)
-            if null_plv_pool:
-                null_plv_pool = np.concatenate(null_plv_pool, axis=0)
+            null_plv_pool = compute_pool_null()
+            if null_plv_pool is not None:
                 p_val_pool = (null_plv_pool >= plv[None, :, :]).mean(axis=0)
                 if args.correction == "fdr":
                     sig_mask_pool, _ = fdr_bh(p_val_pool)
