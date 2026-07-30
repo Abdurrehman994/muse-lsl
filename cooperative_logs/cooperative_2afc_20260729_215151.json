@@ -1,0 +1,38 @@
+{
+  "started": "2026-07-29T21:51:23.421055",
+  "blocks": [
+    {
+      "block_num": 1,
+      "condition": "alone",
+      "lsl_marker_time": 289935.1232579,
+      "rounds": [
+        {
+          "phase": "alone",
+          "n_left": 26,
+          "n_right": 31,
+          "correct_side": "right"
+        }
+      ]
+    },
+    {
+      "block_num": 2,
+      "condition": "cooperative",
+      "lsl_marker_time": 289947.4961777,
+      "rounds": [
+        {
+          "phase": "cooperative",
+          "n_left": 24,
+          "n_right": 28,
+          "correct_side": "right",
+          "participant_choices": {
+            "participant_a": "right",
+            "participant_b": "right"
+          },
+          "agreement": true,
+          "joint_correct": true,
+          "correct": true
+        }
+      ]
+    }
+  ]
+}

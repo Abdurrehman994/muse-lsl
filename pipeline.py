@@ -480,22 +480,6 @@ def load_and_preprocess_continuous(csv_path, subject_label, h_freq=40.0,
 # 3. CONNECTIVITY (PLV / circular correlation)
 # ============================================================
 
-def bandpass_epochs_array(data, sfreq, band, order=4):
-    """
-    Band-pass an (n_epochs, n_channels, n_times) array using the SAME filter
-    design HyPyP would otherwise apply internally (IIR Butterworth), but
-    applied to CONTINUOUS per-epoch arrays only when pre-filtering wasn't
-    already done on the raw signal. Kept for completeness / fallback use;
-    the preferred path (--prefilter) filters the CONTINUOUS raw signal
-    instead, see `prefilter_raw_for_band`.
-    """
-    from scipy.signal import butter, filtfilt
-    nyq = sfreq / 2.0
-    low, high = band
-    b, a = butter(order, [low / nyq, high / nyq], btype="band")
-    return filtfilt(b, a, data, axis=-1)
-
-
 def prefilter_raw_for_band(raw, band, order=4):
     """
     Band-pass the CONTINUOUS raw signal into `band` BEFORE epoching.

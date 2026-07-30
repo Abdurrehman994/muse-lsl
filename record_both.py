@@ -388,6 +388,17 @@ def record_both(name_a, name_b, duration):
 # Post-processing + save
 # ============================================================
 
+def sanitize_filename_part(s):
+    """Replace characters that are invalid (or special, e.g. NTFS Alternate
+    Data Streams via ':') in a Windows filename. NAME_A/NAME_B are also used
+    as MAC-address substrings for stream matching (e.g. 'D1:A1'), which is
+    fine for matching but silently corrupts file saving if used as-is: a
+    colon in a path makes Windows write into a hidden alternate data stream
+    instead of erroring, producing a 0-byte visible file with no warning."""
+    invalid = '\\/:*?"<>|'
+    return "".join("_" if c in invalid else c for c in s)
+
+
 def process_and_save(df_raw, fs_nominal, stream_name, stamp, marker_events):
     if len(df_raw) < 2:
         print(f"  {stream_name}: not enough data — nothing saved.")
@@ -439,6 +450,8 @@ stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 label_a = NAME_A if NAME_A != NAME_B else f"{NAME_A}_A"
 label_b = NAME_B if NAME_A != NAME_B else f"{NAME_B}_B"
+label_a = sanitize_filename_part(label_a)
+label_b = sanitize_filename_part(label_b)
 path_a, mask_a = process_and_save(df_a, fs_a, label_a, stamp, marker_events)
 path_b, mask_b = process_and_save(df_b, fs_b, label_b, stamp, marker_events)
 

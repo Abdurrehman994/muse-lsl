@@ -1,0 +1,42 @@
+﻿[
+  {
+    "marker": "ALONE_start",
+    "lsl_timestamp": 290780.9778283,
+    "rel_time_s": 1.7201534999767318
+  },
+  {
+    "marker": "COOPERATIVE_start",
+    "lsl_timestamp": 290817.377874,
+    "rel_time_s": 38.12019919999875
+  },
+  {
+    "marker": "COOPERATIVE_trial_start",
+    "lsl_timestamp": 290820.3535773,
+    "rel_time_s": 41.09590249997564
+  },
+  {
+    "marker": "COOPERATIVE_choice_01",
+    "lsl_timestamp": 290820.3536469,
+    "rel_time_s": 41.095972099981736
+  },
+  {
+    "marker": "COOPERATIVE_trial_start",
+    "lsl_timestamp": 290831.2125727,
+    "rel_time_s": 51.95489789999556
+  },
+  {
+    "marker": "COOPERATIVE_choice_13",
+    "lsl_timestamp": 290831.2126419,
+    "rel_time_s": 51.95496709999861
+  },
+  {
+    "marker": "COOPERATIVE_trial_start",
+    "lsl_timestamp": 290839.0557087,
+    "rel_time_s": 59.79803389997687
+  },
+  {
+    "marker": "COOPERATIVE_choice_03",
+    "lsl_timestamp": 290839.0557768,
+    "rel_time_s": 59.79810200002976
+  }
+]

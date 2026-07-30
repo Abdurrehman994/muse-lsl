@@ -1,0 +1,88 @@
+{
+  "started": "2026-07-29T22:05:29.275635",
+  "blocks": [
+    {
+      "block_num": 1,
+      "condition": "alone",
+      "lsl_marker_time": 290780.9778283,
+      "rounds": [
+        {
+          "phase": "alone",
+          "category": "analogy",
+          "question": "FISH is to WATER as BIRD is to ___?",
+          "correct_answer": "Air"
+        },
+        {
+          "phase": "alone",
+          "category": "logic",
+          "question": "A is taller than B. B is taller than C. Is A definitely taller than C?",
+          "correct_answer": "Yes"
+        },
+        {
+          "phase": "alone",
+          "category": "trivia",
+          "question": "Which organ pumps blood through the body?",
+          "correct_answer": "Heart"
+        }
+      ]
+    },
+    {
+      "block_num": 2,
+      "condition": "cooperative",
+      "lsl_marker_time": 290817.377874,
+      "rounds": [
+        {
+          "phase": "cooperative",
+          "category": "trivia",
+          "question": "What is the chemical symbol for gold?",
+          "options": [
+            "Ag",
+            "Au",
+            "Gd",
+            "Go"
+          ],
+          "correct_answer": "Au",
+          "participant_a_answer": "Ag",
+          "participant_b_answer": "Au",
+          "agreement": false,
+          "joint_correct": false,
+          "correct": false
+        },
+        {
+          "phase": "cooperative",
+          "category": "analogy",
+          "question": "AUTHOR is to BOOK as DIRECTOR is to ___?",
+          "options": [
+            "Camera",
+            "Movie",
+            "Actor",
+            "Script"
+          ],
+          "correct_answer": "Movie",
+          "participant_a_answer": "Movie",
+          "participant_b_answer": "Script",
+          "agreement": false,
+          "joint_correct": false,
+          "correct": false
+        },
+        {
+          "phase": "cooperative",
+          "category": "analogy",
+          "question": "DOCTOR is to HOSPITAL as TEACHER is to ___?",
+          "options": [
+            "Book",
+            "School",
+            "Student",
+            "Chalk"
+          ],
+          "correct_answer": "School",
+          "participant_a_answer": "Book",
+          "participant_b_answer": "Chalk",
+          "agreement": false,
+          "joint_correct": false,
+          "correct": false
+        }
+      ]
+    }
+  ]
+}
