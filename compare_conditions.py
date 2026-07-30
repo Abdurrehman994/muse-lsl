@@ -1,7 +1,10 @@
 """
 compare_conditions.py — contrast inter-brain synchrony between two task
-conditions (ALONE vs COOPERATIVE) recorded within ONE continuous session,
-segmented via the block markers that cooperative_task.py fires.
+conditions recorded within ONE continuous session, segmented via block
+markers. Works with any block-design task script's markers -- e.g.
+cooperative_task.py's ALONE vs COOPERATIVE, or video_task.py's ALONE vs
+VIDEO -- see BLOCK_BOUNDARY_MARKERS below; it just needs exactly two
+distinct condition labels present in the recording's _markers.json.
 
 Uses the same continuous artifact-rejection / PLV / circular-correlation
 machinery as pipeline.py's default path (see pipeline.py, changelog point 6):
@@ -18,9 +21,9 @@ blocks count as ALONE vs COOPERATIVE (preserving each block's internal
 data), NOT by shuffling individual samples -- adjacent EEG samples are
 autocorrelated, so a sample-level shuffle would be anti-conservative (the
 same class of bias --epoch-len used to have, see pipeline.py point 5).
-This means --reps in cooperative_task.py matters: with only 1 block per
-condition there are only 2 possible block-to-label assignments, so the
-permutation test has essentially no resolution. Aim for --reps 3+.
+This means --reps in whichever task script you used matters: with only 1
+block per condition there are only 2 possible block-to-label assignments,
+so the permutation test has essentially no resolution. Aim for --reps 3+.
 
 Usage:
     python compare_conditions.py recordings/<stamp>_A.csv recordings/<stamp>_B.csv
@@ -50,7 +53,15 @@ from pipeline import (
     preprocess,
 )
 
-CONDITION_MARKER_PREFIXES = ("ALONE", "COOPERATIVE")
+# Block-boundary markers recognized across all block-design task scripts
+# (cooperative_task.py's ALONE_start/COOPERATIVE_start, video_task.py's
+# ALONE_start/VIDEO_start). An exact-match registry rather than a generic
+# "ends with _start" check, since cooperative_task.py also fires a
+# COOPERATIVE_trial_start marker once per quiz question (not once per
+# block) -- treating that as a third condition would break the
+# exactly-2-labels assumption below. Add new task scripts' block markers
+# here as they're built.
+BLOCK_BOUNDARY_MARKERS = {"ALONE_start", "COOPERATIVE_start", "VIDEO_start"}
 
 
 def load_all_markers(csv_path):
@@ -64,10 +75,10 @@ def load_all_markers(csv_path):
 
 
 def condition_label(marker_name):
-    """'ALONE_start' -> 'ALONE', or None if not a condition marker."""
-    for prefix in CONDITION_MARKER_PREFIXES:
-        if prefix in marker_name:
-            return prefix
+    """'ALONE_start' -> 'ALONE', or None if this isn't a recognized
+    block-boundary marker (see BLOCK_BOUNDARY_MARKERS)."""
+    if marker_name in BLOCK_BOUNDARY_MARKERS:
+        return marker_name[: -len("_start")]
     return None
 
 

@@ -210,14 +210,31 @@ def _mouse_callback(event, x, y, flags, param):
         _mouse_state["click"] = (x, y)
 
 
+def get_screen_size():
+    """(width, height) of the primary screen, or None if unavailable (e.g.
+    non-Windows without a display)."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    except Exception:
+        return None
+
+
 def make_window(fullscreen, window_x, window_y, width=1100, height=700):
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
     if fullscreen:
         cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     else:
         cv2.resizeWindow(WIN_NAME, width, height)
-        if window_x is not None or window_y is not None:
-            cv2.moveWindow(WIN_NAME, window_x or 0, window_y or 0)
+        if window_x is None and window_y is None:
+            # default: center on the primary screen
+            screen_size = get_screen_size()
+            if screen_size is not None:
+                screen_w, screen_h = screen_size
+                window_x = max(0, (screen_w - width) // 2)
+                window_y = max(0, (screen_h - height) // 2)
+        cv2.moveWindow(WIN_NAME, window_x or 0, window_y or 0)
     cv2.setMouseCallback(WIN_NAME, _mouse_callback)
     return (height, width)
 
