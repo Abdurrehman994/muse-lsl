@@ -1,0 +1,4 @@
+Recording summary 2026-07-30T21:39:24.257508
+A: D1_A1  samples=80424  fs=256
+B: CB_54  samples=79572  fs=256
+dropout: stream timeout detected for CB:54 (no samples for > 3.0s)

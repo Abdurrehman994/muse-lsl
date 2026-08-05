@@ -17,8 +17,17 @@ inter-subject-correlation literature (Hasson et al. 2008), where clip
 choice and length matter a lot for how much shared engagement/entrainment
 they produce -- so this isn't assumed to reproduce the earlier null result.
 
-Clip content: see make_video_clips.py to cut short clips out of a longer
-source video (e.g. stimulus.mp4) with no ffmpeg dependency.
+VIDEO blocks play a random segment (with its original audio/voice) pulled
+live from whatever full-length source videos sit in --sources-dir (default
+stimuli/sources/) -- a fresh random start time is drawn every time a segment
+is played, so re-running this script (or looping through more reps) shows
+different footage instead of the same clip every time. Playback uses
+ffpyplayer (MediaPlayer) instead of cv2.VideoCapture because OpenCV cannot
+decode/output audio at all -- cv2 is still used only to display frames and
+manage the window.
+
+(make_video_clips.py's pre-cut silent clips are a separate, older workflow
+for stimulus.mp4 and are unaffected by this.)
 
 IBS workflow
 ────────────────────────────────────────────────────────────────
@@ -30,13 +39,14 @@ IBS workflow
   2. Press ENTER in the terminal to begin.
   3. Blocks alternate automatically; a marker fires at the start of each.
      ALONE blocks auto-advance (silent countdown). VIDEO blocks play one
-     clip fully, then auto-advance.
+     randomly-chosen segment (with audio) fully, then auto-advance.
   4. record_both.py captures every marker into its _markers.json sidecars.
   5. Analyze with: python compare_conditions.py <A.csv> <B.csv>
 
 Usage:
-  python video_task.py                          # 3 reps (one per clip in stimuli/clips/), 60s alone blocks
-  python video_task.py --clips-dir stimuli/clips --reps 3
+  python video_task.py                          # 3 reps (one per source video in stimuli/sources/), 60s alone blocks
+  python video_task.py --sources-dir stimuli/sources --reps 3
+  python video_task.py --clip-length 60         # shorter video segments (default 90s)
   python video_task.py --alone-len 45
   python video_task.py --window-x 1920 --fullscreen
   python video_task.py --start video           # start with a video instead of alone
@@ -52,9 +62,11 @@ from datetime import datetime
 
 import cv2
 import numpy as np
+from ffpyplayer.player import MediaPlayer
 from pylsl import StreamInfo, StreamOutlet, local_clock
 
 from cooperative_task import get_screen_size
+from make_video_clips import get_duration_s
 
 try:
     import winsound
@@ -86,25 +98,35 @@ def beep(n, audio_enabled):
         time.sleep(0.15)
 
 
-class ClipDeck:
-    """Draws clip paths without repeats until the pool is exhausted, then
-    reshuffles (same pattern as cooperative_task.py's QuestionDeck)."""
+class SegmentDeck:
+    """Draws (source_path, start_s) segments without repeating a SOURCE
+    VIDEO until the pool is exhausted, then reshuffles (same pattern as
+    cooperative_task.py's QuestionDeck) -- but unlike a fixed clip file,
+    start_s is re-rolled fresh on every draw, so replays of the same source
+    later in the session (or on the next run of this script) land on a
+    different segment instead of repeating the exact same footage."""
 
-    def __init__(self, rng, clip_paths):
-        if not clip_paths:
+    def __init__(self, rng, source_paths, clip_length):
+        if not source_paths:
             raise SystemExit(
-                "ERROR: no clips found. Run make_video_clips.py first, "
-                "e.g.: python make_video_clips.py stimulus.mp4"
+                "ERROR: no source videos found. Add some .mp4 files to "
+                "stimuli/sources/ (e.g. the videos you just downloaded)."
             )
         self.rng = rng
-        self.pool = list(clip_paths)
+        self.clip_length = clip_length
+        self.pool = list(source_paths)
         self._remaining = []
+        self._durations = {p: get_duration_s(p) for p in source_paths}
 
     def draw(self):
         if not self._remaining:
             self._remaining = list(self.pool)
             self.rng.shuffle(self._remaining)
-        return self._remaining.pop()
+        source_path = self._remaining.pop()
+        duration_s = self._durations[source_path]
+        max_start = max(0.0, duration_s - self.clip_length)
+        start_s = self.rng.uniform(0.0, max_start) if max_start > 0 else 0.0
+        return source_path, start_s
 
 
 def make_window(fullscreen, window_x, window_y, width=960, height=600):
@@ -168,52 +190,64 @@ def run_alone_block(shape, alone_len):
     show(blank_frame(shape))
 
 
-def run_video_block(shape, clip_path):
-    cap = cv2.VideoCapture(clip_path)
-    if not cap.isOpened():
-        print(f"  WARNING: could not open {clip_path} -- skipping this block")
-        return
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_s = n_frames / fps if fps > 0 else 0
-    print(f"  Playing {os.path.basename(clip_path)} ({duration_s:.1f}s)")
+def run_video_block(shape, source_path, start_s, length_s, audio_enabled):
+    """Plays [start_s, start_s+length_s) of source_path, audio included.
 
-    t_start = time.perf_counter()
-    frame_idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        fh, fw = shape
-        frame = cv2.resize(frame, (fw, fh))
-        show(frame)
-        frame_idx += 1
-        elapsed = time.perf_counter() - t_start
-        target = frame_idx / fps
-        wait_ms = max(1, int((target - elapsed) * 1000))
-        cv2.waitKey(wait_ms)
-    cap.release()
+    Uses ffpyplayer's MediaPlayer (not cv2.VideoCapture) because OpenCV has
+    no audio support at all -- it can only decode/display video frames.
+    MediaPlayer decodes both and plays audio itself (via SDL) in real time;
+    cv2 is used here only to draw the returned video frames into our window.
+    """
+    print(f"  Playing {os.path.basename(source_path)} "
+          f"@ {start_s:.1f}s ({length_s:.0f}s, audio {'on' if audio_enabled else 'off'})")
+    player = MediaPlayer(
+        source_path,
+        ff_opts={"ss": start_s, "t": length_s, "an": not audio_enabled},
+    )
+    fh, fw = shape
+    try:
+        while True:
+            frame, val = player.get_frame()
+            if val == "eof":
+                break
+            if frame is None:
+                pump()
+                time.sleep(0.01)
+                continue
+            img, pts = frame
+            w, h = img.get_size()
+            buf = bytes(img.to_memoryview()[0])
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            arr = cv2.resize(arr, (fw, fh))
+            show(arr)
+            if val:
+                time.sleep(val)
+    finally:
+        player.close_player()
     show(blank_frame(shape))
 
 
-def run(clips_dir, alone_len, reps, start_condition, audio_enabled,
+def run(sources_dir, clip_length, alone_len, reps, start_condition, audio_enabled,
         fullscreen, window_x, window_y):
     order = ["alone", "video"]
     if start_condition == "video":
         order = ["video", "alone"]
 
-    clip_paths = sorted(glob.glob(os.path.join(clips_dir, "*.mp4")))
+    source_paths = sorted(glob.glob(os.path.join(sources_dir, "*.mp4")))
     rng = random.Random()
-    deck = ClipDeck(rng, clip_paths)
+    deck = SegmentDeck(rng, source_paths, clip_length)
     total_blocks = reps * len(order)
 
     print("=" * 60)
     print("Video-task (ALONE vs VIDEO) block script")
     print(f"  alone block length: {alone_len:.0f}s")
-    print(f"  clips found: {len(clip_paths)} in {clips_dir}")
+    print(f"  video segment length: {clip_length:.0f}s")
+    print(f"  source videos found: {len(source_paths)} in {sources_dir} "
+          f"({', '.join(os.path.basename(p) for p in source_paths)})")
     print(f"  reps/condition: {reps}  ({total_blocks} blocks total)")
     print(f"  starting with : {order[0]}")
-    print(f"  audio cues    : {'on' if audio_enabled and _HAVE_WINSOUND else 'off'}")
+    print(f"  audio (beeps + video voice): {'on' if audio_enabled else 'off'}")
     if reps < 3:
         print("  NOTE: --reps below 3 gives compare_conditions.py's block-"
               "permutation contrast test very little resolution -- "
@@ -256,7 +290,8 @@ def run(clips_dir, alone_len, reps, start_condition, audio_enabled,
             if cond_key == "alone":
                 run_alone_block(shape, alone_len)
             else:
-                run_video_block(shape, deck.draw())
+                source_path, start_s = deck.draw()
+                run_video_block(shape, source_path, start_s, clip_length, audio_enabled)
 
     show(blank_frame(shape))
     print("\nAll blocks complete. Stop record_both.py now if it's still running.")
@@ -272,21 +307,27 @@ def main():
                      "short-clip task.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--clips-dir", default="stimuli/clips",
-                   help="directory of short .mp4 clips (default stimuli/clips, "
-                        "see make_video_clips.py to generate them)")
+    p.add_argument("--sources-dir", default="stimuli/sources",
+                   help="directory of full-length source .mp4 videos to pull "
+                        "random VIDEO-block segments from, audio included "
+                        "(default stimuli/sources)")
+    p.add_argument("--clip-length", type=float, default=90.0,
+                   help="seconds to play per VIDEO block, drawn from a fresh "
+                        "random start point in the source video each time "
+                        "(default 90)")
     p.add_argument("--alone-len", type=float, default=60.0,
                    help="seconds for each ALONE block (default 60)")
     p.add_argument("--reps", type=int, default=3,
                    help="repetitions of each condition block (default 3, "
-                        "matching a 3-clip pool). "
+                        "matching a 3-video pool). "
                         "compare_conditions.py's block-permutation contrast "
                         "test needs several reps per condition to have any "
                         "resolution -- 1-2 reps is not enough.")
     p.add_argument("--start", choices=["alone", "video"], default="alone",
                    help="which condition to start with (default alone)")
     p.add_argument("--no-audio", action="store_true",
-                   help="disable beep cues (console text only)")
+                   help="disable beep cues AND video audio/voice (silent, "
+                        "console text only)")
     p.add_argument("--fullscreen", action="store_true",
                    help="participant-facing window fullscreen")
     p.add_argument("--window-x", type=int, default=None,
@@ -295,7 +336,7 @@ def main():
                    help="y position (px) to place the participant window")
     args = p.parse_args()
 
-    run(args.clips_dir, args.alone_len, args.reps, args.start,
+    run(args.sources_dir, args.clip_length, args.alone_len, args.reps, args.start,
         not args.no_audio, args.fullscreen, args.window_x, args.window_y)
 
 

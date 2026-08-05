@@ -4,7 +4,7 @@ standard visual stimulus for driving an SSVEP (steady-state visually evoked
 potential). Same idea as peterscarfe.com/contrastRevCheckerboard.html, baked
 into an .mp4 so play_stimulus.py can play it while record_both.py records.
 
-Two uses:
+Two use:
   1. Positive control (sanity check): both subjects watch the SAME clip.
      If the pipeline can't find strong PLV/circ-corr at the reversal
      frequency here, the problem is measurement, not "no synchrony".

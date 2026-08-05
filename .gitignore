@@ -5,6 +5,10 @@ recordings/*.csv
 out/
 *.log
 stimuli/checker_combined.mp4
+# full-length source videos for video_task.py -- can be 100s of MB each,
+# well past GitHub's 100MB per-file hard limit; read locally at runtime,
+# never meant to be versioned
+stimuli/sources/
 
 build/
 dist/
