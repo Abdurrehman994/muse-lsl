@@ -44,7 +44,7 @@ IBS workflow
   5. Analyze with: python compare_conditions.py <A.csv> <B.csv>
 
 Usage:
-  python video_task.py                          # 3 reps (one per source video in stimuli/sources/), 60s alone blocks
+  python video_task.py                          # 3 reps (one per source video in stimuli/sources/), 25s alone blocks
   python video_task.py --sources-dir stimuli/sources --reps 3
   python video_task.py --clip-length 60         # shorter video segments (default 90s)
   python video_task.py --alone-len 45
@@ -104,7 +104,12 @@ class SegmentDeck:
     cooperative_task.py's QuestionDeck) -- but unlike a fixed clip file,
     start_s is re-rolled fresh on every draw, so replays of the same source
     later in the session (or on the next run of this script) land on a
-    different segment instead of repeating the exact same footage."""
+    different segment instead of repeating the exact same footage.
+
+    Also guards the reshuffle boundary: with --reps greater than the number
+    of source videos, a naive reshuffle can land on the same source twice
+    in a row (the last draw of one cycle and the first of the next) --
+    draw() swaps that case away so the same clip never plays back-to-back."""
 
     def __init__(self, rng, source_paths, clip_length):
         if not source_paths:
@@ -116,13 +121,21 @@ class SegmentDeck:
         self.clip_length = clip_length
         self.pool = list(source_paths)
         self._remaining = []
+        self._last_source = None
         self._durations = {p: get_duration_s(p) for p in source_paths}
 
     def draw(self):
         if not self._remaining:
             self._remaining = list(self.pool)
             self.rng.shuffle(self._remaining)
+            # avoid a back-to-back repeat across the reshuffle boundary
+            if (len(self._remaining) > 1 and self._last_source is not None
+                    and self._remaining[-1] == self._last_source):
+                swap_idx = self.rng.randrange(len(self._remaining) - 1)
+                self._remaining[-1], self._remaining[swap_idx] = (
+                    self._remaining[swap_idx], self._remaining[-1])
         source_path = self._remaining.pop()
+        self._last_source = source_path
         duration_s = self._durations[source_path]
         max_start = max(0.0, duration_s - self.clip_length)
         start_s = self.rng.uniform(0.0, max_start) if max_start > 0 else 0.0
@@ -315,8 +328,8 @@ def main():
                    help="seconds to play per VIDEO block, drawn from a fresh "
                         "random start point in the source video each time "
                         "(default 90)")
-    p.add_argument("--alone-len", type=float, default=60.0,
-                   help="seconds for each ALONE block (default 60)")
+    p.add_argument("--alone-len", type=float, default=25.0,
+                   help="seconds for each ALONE block (default 25)")
     p.add_argument("--reps", type=int, default=3,
                    help="repetitions of each condition block (default 3, "
                         "matching a 3-video pool). "

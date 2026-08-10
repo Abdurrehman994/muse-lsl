@@ -1,0 +1,22 @@
+[
+  {
+    "marker": "ALONE_start",
+    "lsl_timestamp": 78777.2128536,
+    "rel_time_s": 30.563426900000195
+  },
+  {
+    "marker": "VIDEO_start",
+    "lsl_timestamp": 78802.5854374,
+    "rel_time_s": 55.93601070001023
+  },
+  {
+    "marker": "ALONE_start",
+    "lsl_timestamp": 78909.3480167,
+    "rel_time_s": 162.69858999999997
+  },
+  {
+    "marker": "VIDEO_start",
+    "lsl_timestamp": 78934.7067506,
+    "rel_time_s": 188.05732390000776
+  }
+]

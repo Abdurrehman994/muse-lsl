@@ -1,0 +1,12 @@
+[
+  {
+    "marker": "calibrate",
+    "lsl_timestamp": 77247.2264167,
+    "rel_time_s": 3.3769842999899993
+  },
+  {
+    "marker": "calibrate",
+    "lsl_timestamp": 77351.2114031,
+    "rel_time_s": 107.36197069998889
+  }
+]

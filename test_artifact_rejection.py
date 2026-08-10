@@ -18,6 +18,16 @@ continuous_bad_mask() flags exactly what it should:
      artifact present (the annotation-folding code path).
   5. Clean baseline far from any injected event has zero false positives.
 
+Cases 1-4 pin pad_s=0.0 so they isolate the window/threshold/annotation
+logic from the pad_s dilation (see case 6 below) -- otherwise the two
+features would be entangled and a regression in either one could hide
+behind the other.
+
+  6. pad_s dilates a flagged run by exactly pad_s on each side (the
+     margin added so band-pass filter ringing at an artifact's edge, e.g.
+     from a railed/saturated segment, can't leak into a neighboring
+     sample still counted as clean), and pad_s=0 disables it.
+
 Usage:
   python test_artifact_rejection.py
 """
@@ -104,7 +114,7 @@ def main():
 
     raw = make_raw(data_uv)
     mask = continuous_bad_mask(raw, window_s=WINDOW_S, step_s=STEP_S,
-                                threshold_uv=THRESHOLD_UV)
+                                threshold_uv=THRESHOLD_UV, pad_s=0.0)
 
     pad = int(round(WINDOW_S * SFREQ))
 
@@ -166,7 +176,7 @@ def main():
                            description=["BAD_gap"])
     raw_gap = make_raw(data_uv_gap, annotations=ann)
     mask_gap = continuous_bad_mask(raw_gap, window_s=WINDOW_S, step_s=STEP_S,
-                                    threshold_uv=THRESHOLD_UV)
+                                    threshold_uv=THRESHOLD_UV, pad_s=0.0)
     gap_start = int(round(gap_onset_s * SFREQ))
     gap_end = int(round((gap_onset_s + gap_dur_s) * SFREQ))
 
@@ -186,6 +196,53 @@ def main():
                              check_gap_annotation_folded))
     results.append(run_case("no false positives elsewhere in the gap-only signal",
                              check_gap_no_bleed_from_amplitude))
+
+    # ------------------------------------------------------------------
+    # Case 6: pad_s dilates a flagged run by exactly pad_s on each side,
+    # and pad_s=0 (used throughout cases 1-4 above) disables it.
+    # ------------------------------------------------------------------
+    data_uv_pad = make_synthetic_data(seed=2)
+    pad_burst_start, pad_burst_end = inject_burst(data_uv_pad, ch_idx=0,
+                                                   start_s=10.0, end_s=10.4,
+                                                   ptp_uv=800.0)
+    raw_pad = make_raw(data_uv_pad)
+    pad_s = 0.3
+    mask_padded = continuous_bad_mask(raw_pad, window_s=WINDOW_S, step_s=STEP_S,
+                                       threshold_uv=THRESHOLD_UV, pad_s=pad_s)
+    mask_unpadded = continuous_bad_mask(raw_pad, window_s=WINDOW_S, step_s=STEP_S,
+                                         threshold_uv=THRESHOLD_UV, pad_s=0.0)
+    unpadded_start = np.argmax(mask_unpadded)
+    unpadded_end = len(mask_unpadded) - np.argmax(mask_unpadded[::-1])
+    pad_n = int(round(pad_s * SFREQ))
+
+    def check_pad_extends_flagged_region():
+        expected_start = max(0, unpadded_start - pad_n)
+        expected_end = min(len(mask_padded), unpadded_end + pad_n)
+        assert mask_padded[expected_start:expected_end].all(), \
+            "pad_s did not extend the flagged region by pad_s on both sides"
+
+    def check_pad_does_not_overextend():
+        before = unpadded_start - pad_n - 5
+        after = unpadded_end + pad_n + 5
+        assert before < 0 or not mask_padded[before], \
+            "pad_s extended the flagged region further than pad_s"
+        assert after >= len(mask_padded) or not mask_padded[after], \
+            "pad_s extended the flagged region further than pad_s"
+
+    def check_pad_zero_matches_unpadded():
+        assert np.array_equal(mask_unpadded,
+                               continuous_bad_mask(raw_pad, window_s=WINDOW_S,
+                                                    step_s=STEP_S,
+                                                    threshold_uv=THRESHOLD_UV,
+                                                    pad_s=0.0)), \
+            "pad_s=0.0 is not reproducible/deterministic"
+
+    results.append(run_case("pad_s extends the flagged region by pad_s on both sides",
+                             check_pad_extends_flagged_region))
+    results.append(run_case("pad_s does not extend further than pad_s",
+                             check_pad_does_not_overextend))
+    results.append(run_case("pad_s=0.0 disables padding",
+                             check_pad_zero_matches_unpadded))
 
     n_pass = sum(results)
     n_total = len(results)

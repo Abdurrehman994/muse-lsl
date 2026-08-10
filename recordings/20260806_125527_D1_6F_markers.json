@@ -1,0 +1,32 @@
+[
+  {
+    "marker": "ALONE_start",
+    "lsl_timestamp": 164210.0290043,
+    "rel_time_s": 86.70372590000625
+  },
+  {
+    "marker": "VIDEO_start",
+    "lsl_timestamp": 164235.3960195,
+    "rel_time_s": 112.07074110000394
+  },
+  {
+    "marker": "ALONE_start",
+    "lsl_timestamp": 164328.3872433,
+    "rel_time_s": 205.06196490000002
+  },
+  {
+    "marker": "VIDEO_start",
+    "lsl_timestamp": 164353.7485756,
+    "rel_time_s": 230.4232972000027
+  },
+  {
+    "marker": "ALONE_start",
+    "lsl_timestamp": 164449.0004172,
+    "rel_time_s": 325.6751387999975
+  },
+  {
+    "marker": "VIDEO_start",
+    "lsl_timestamp": 164474.3597021,
+    "rel_time_s": 351.03442369998083
+  }
+]

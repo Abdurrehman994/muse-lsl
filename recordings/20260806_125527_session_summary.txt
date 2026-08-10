@@ -1,0 +1,4 @@
+Recording summary 2026-08-06T12:55:29.722787
+A: D1_A1  samples=103704  fs=256
+B: D1_6F  samples=103668  fs=256
+dropout: none

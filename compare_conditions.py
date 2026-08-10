@@ -55,13 +55,15 @@ from pipeline import (
 
 # Block-boundary markers recognized across all block-design task scripts
 # (cooperative_task.py's ALONE_start/COOPERATIVE_start, video_task.py's
-# ALONE_start/VIDEO_start). An exact-match registry rather than a generic
-# "ends with _start" check, since cooperative_task.py also fires a
-# COOPERATIVE_trial_start marker once per quiz question (not once per
-# block) -- treating that as a third condition would break the
-# exactly-2-labels assumption below. Add new task scripts' block markers
-# here as they're built.
-BLOCK_BOUNDARY_MARKERS = {"ALONE_start", "COOPERATIVE_start", "VIDEO_start"}
+# ALONE_start/VIDEO_start, sync_tapping_task.py's SOLO_start/SYNC_start).
+# An exact-match registry rather than a generic "ends with _start" check,
+# since cooperative_task.py also fires a COOPERATIVE_trial_start marker
+# once per quiz question (not once per block), and sync_tapping_task.py
+# fires TAP_A/TAP_B per tap -- treating those as extra conditions would
+# break the exactly-2-labels assumption below. Add new task scripts' block
+# markers here as they're built.
+BLOCK_BOUNDARY_MARKERS = {"ALONE_start", "COOPERATIVE_start", "VIDEO_start",
+                          "SOLO_start", "SYNC_start"}
 
 
 def load_all_markers(csv_path):
