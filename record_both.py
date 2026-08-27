@@ -17,6 +17,8 @@ Usage:
     python record_both.py                        # 60s, Muse_A + Muse_B
     python record_both.py 120                    # 120s
     python record_both.py 120 Muse_A Muse_B      # custom stream names
+    python record_both.py 65 Muse_A Muse_B --ssvep     # + auto GO/NO-GO SSVEP gate after saving (6 Hz)
+    python record_both.py 65 Muse_A Muse_B --ssvep=8   # ... flicker at a non-default rate
 
 Output (in recordings/):
     <stamp>_Muse_A.csv   <stamp>_Muse_A_markers.json
@@ -24,6 +26,12 @@ Output (in recordings/):
 
 Feed directly into pipeline.py:
     python pipeline.py recordings/<stamp>_Muse_A.csv recordings/<stamp>_Muse_B.csv
+
+--ssvep: for shared-flicker POSITIVE-CONTROL recordings only. After saving,
+runs check_ssvep_control.py on the two CSVs to confirm the flicker actually
+drove an SSVEP (GO), rather than discovering a dead recording later during a
+full pipeline run. Opt-in because a real-dyad task recording has no flicker,
+so the check would be meaningless there.
 """
 
 import sys
@@ -44,9 +52,28 @@ except ImportError:
     _HAVE_SCIPY = False
 
 # ---- config ----
-DURATION         = int(sys.argv[1]) if len(sys.argv) > 1 else 60
-NAME_A           = sys.argv[2] if len(sys.argv) > 2 else "Muse_A"
-NAME_B           = sys.argv[3] if len(sys.argv) > 3 else "Muse_B"
+def _extract_ssvep_flag(argv):
+    """Pull an optional SSVEP-gate flag out of argv so the positional
+    duration/name parsing below is unaffected. Bare '--ssvep' is a pure
+    boolean (never consumes the next token -- that would swallow the
+    positional duration if the flag were placed first); use '--ssvep=HZ' to
+    set a non-default flicker rate. Returns (enabled, hz, remaining_argv);
+    HZ defaults to 6.0 (the project's checker_6hz.mp4 reversal rate)."""
+    enabled, hz, rest = False, None, []
+    for a in argv:
+        if a == "--ssvep":
+            enabled = True
+        elif a.startswith("--ssvep="):
+            enabled, hz = True, float(a.split("=", 1)[1])
+        else:
+            rest.append(a)
+    return enabled, (6.0 if hz is None else hz), rest
+
+
+_SSVEP_CHECK, _SSVEP_HZ, _ARGV = _extract_ssvep_flag(sys.argv[1:])
+DURATION         = int(_ARGV[0]) if len(_ARGV) > 0 else 60
+NAME_A           = _ARGV[1] if len(_ARGV) > 1 else "Muse_A"
+NAME_B           = _ARGV[2] if len(_ARGV) > 2 else "Muse_B"
 CH_NAMES         = ["TP9", "AF7", "AF8", "TP10"]
 OUT_DIR          = "recordings"
 TARGET_FS        = 256
@@ -473,3 +500,13 @@ if not _HAVE_SCIPY:
 if path_a and path_b:
     print(f"\nRun the analysis pipeline with:")
     print(f"  python pipeline.py {path_a} {path_b} --surrogate 200")
+
+    if _SSVEP_CHECK:
+        print(f"\n{'=' * 60}")
+        print(f"SSVEP positive-control pre-flight gate ({_SSVEP_HZ:g} Hz flicker):")
+        print("=" * 60)
+        import subprocess
+        check_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "check_ssvep_control.py")
+        subprocess.run([sys.executable, check_script, path_a, path_b,
+                        "--stim-hz", str(_SSVEP_HZ)])

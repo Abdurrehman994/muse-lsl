@@ -43,6 +43,7 @@ from pipeline import (
     circ_corr_masked,
     matched_observed_value,
     pseudo_pair_continuous,
+    summarize_positive_control,
 )
 import mne
 
@@ -185,6 +186,27 @@ def run_case(name, check_fn):
     except AssertionError as e:
         print(f"  FAIL  {name}: {e}")
         return False
+
+
+def test_positive_control_verdict():
+    verdict = summarize_positive_control(
+        np.array([0.15, 0.18]),
+        np.array([0.05, 0.06]),
+        np.array([0.01, 0.02]),
+        sig_mask=np.array([True, False]),
+    )
+    assert verdict["status"] == "PASS"
+    assert verdict["passed"] is True
+    assert verdict["n_sig_pairs"] == 1
+
+    weak_verdict = summarize_positive_control(
+        np.array([0.15, 0.18]),
+        np.array([0.05, 0.06]),
+        np.array([0.2, 0.25]),
+        sig_mask=np.array([False, False]),
+    )
+    assert weak_verdict["status"] == "WEAK"
+    assert weak_verdict["passed"] is False
 
 
 def main():

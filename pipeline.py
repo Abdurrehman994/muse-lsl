@@ -9,7 +9,8 @@ Takes the two CSVs produced by record_both.py and runs the full chain:
               annotations from is_gap column   (BAD_gap, MNE will skip these)
                    |
                    v
-              bandpass filter 1-40 Hz, average reference
+              bandpass filter 1-40 Hz, re-reference (average or linked
+              mastoid -- see point 8, --reference)
                    |
                    v
               continuous sliding-window artifact detection (default, see
@@ -69,7 +70,8 @@ CHANGES IN THIS VERSION (see conversation notes / internship writeup)
    and the pipeline will build a cross-dyad null distribution from them.
 
 2. FDR CORRECTION instead of raw per-pair p<0.05 counts.
-   With 16 channel pairs tested per band at uncorrected p<0.05, you'd expect
+   With 16 channel pairs tested per band (4x4; fewer when
+   --analysis-channels restricts the set, see point 11) at uncorrected p<0.05, you'd expect
    ~0.8 false positives per band by chance alone even under pure noise. The
    old "1/16" and "2/16" significant-pair counts were not meaningfully
    different from chance. This version applies Benjamini-Hochberg FDR
@@ -204,6 +206,328 @@ CHANGES IN THIS VERSION (see conversation notes / internship writeup)
    Zimmermann et al.'s recommendation that adjusted circular correlation
    should be preferred for continuous EEG data, which does not have a
    well-defined circular mean.
+
+8. SELECTABLE RE-REFERENCE (--reference average|mastoid); average is still
+   the default.
+   The Muse's ONLINE reference is FPZ, the electrode in the centre of the
+   forehead. That is a poor choice for ocular artifact specifically: FPZ
+   sits directly over the orbital/frontalis region, so the reference signal
+   itself carries blink and EOG activity. Because every channel is recorded
+   as (X - FPZ), that ocular signal is injected into ALL FOUR channels with
+   the same sign and a similar amplitude -- i.e. as common mode. This is a
+   large part of why ICA (remove_blink_component) separates blinks so poorly
+   here: the artifact is not spatially localised in the data, it is spread
+   evenly across every channel, which looks like signal rather than like a
+   separable component.
+
+   Any re-reference cancels FPZ algebraically, since it appears in every
+   term:
+
+       (X - FPZ) - mean(TP9 - FPZ, TP10 - FPZ)  =  X - mean(TP9, TP10)
+
+   so both --reference average and --reference mastoid remove the FPZ
+   contamination. The difference is what they leave behind:
+
+     average  -- mixes all four electrodes into every channel (each channel
+                 becomes X - mean of all 4). With only 4 electrodes that is
+                 a heavy mix: within-subject channels become artificially
+                 correlated and every channel carries a share of every
+                 other. Fine for inspection, not ideal for connectivity.
+     mastoid  -- references to TP9/TP10, which are far from the eyes. The
+                 frontal channels stay comparatively independent of each
+                 other, which is what the cross-brain metrics actually need.
+
+   Cost of the mastoid option: TP9/TP10 are spent as the reference, and they
+   are the electrodes carrying most of the usable posterior alpha. Under a
+   linked-mastoid reference TP9 and TP10 become +/-(TP9 - TP10)/2, i.e.
+   exact mirror images of each other, so their cross-brain metrics are
+   redundant by construction and only AF7/AF8 carry independent information
+   (preprocess() warns about this at run time). Restricting the metrics to
+   AF7/AF8 is a separate, later change; for now both references are kept
+   available so the same recording can be analysed each way and compared --
+   the console and summary.txt report clean fraction AND longest continuous
+   clean run, which is the number that says whether a reference change
+   actually bought usable data.
+
+9. DERIVED BIPOLAR OCULAR CHANNELS (make_ocular_channels).
+   The Muse has no EOG electrode, which is why blink handling here has been
+   stuck between two bad options: ICA that cannot separate a common-mode
+   artifact from 4 channels (point 8), and amplitude thresholding that
+   throws away good data along with the blink. A third option is to build
+   the missing EOG channels out of the four electrodes we do have:
+
+       saccade = AF7 - AF8
+       blink   = mean(AF7, AF8) - mean(TP9, TP10)
+
+   The logic is ordinary bipolar EOG, improvised from this montage.
+   Horizontal eye movement drives the two frontal sites to OPPOSITE
+   polarity, so differencing them adds the ocular signal and largely
+   cancels the brain signal (which is common to both). Blinks drive both
+   frontal sites to the SAME polarity, so averaging them keeps the blink,
+   and referencing that to the mastoids -- which are far from the eyes --
+   turns it into a quasi-bipolar vertical EOG.
+
+   Two properties worth knowing:
+
+   a) Both are REFERENCE-INVARIANT. Every channel is recorded as (X - R)
+      for a common R, and R cancels in both expressions:
+          (AF7 - R) - (AF8 - R) = AF7 - AF8
+          mean(AF7-R, AF8-R) - mean(TP9-R, TP10-R)
+              = mean(AF7, AF8) - mean(TP9, TP10)
+      So it does not matter where in the chain they are computed, and they
+      are identical under --reference average and --reference mastoid. This
+      is checked in test_ocular_channels.py.
+
+   b) They get a DIFFERENT filter band from the analysis signal: 0.1-15 Hz
+      by default (OCULAR_L_FREQ / OCULAR_H_FREQ, --ocular-band), against
+      1-40 Hz for analysis. The reason is detection SNR, not amplitude.
+      Measured on a synthetic 300ms blink (test_ocular_channels.py, check 3),
+      peak blink amplitude over baseline noise:
+
+          0.1-15 Hz (ocular band)     peak 197 uV   baseline sd  8.2   SNR 24.0
+          1-40 Hz   (analysis band)   peak 176 uV   baseline sd 10.7   SNR 16.4
+
+      So the analysis band still retains ~87% of the blink amplitude -- the
+      1 Hz high-pass does NOT gut a 300ms blink, whose energy is centred
+      nearer 3 Hz than DC. What the ocular band actually buys is a ~1.5x
+      better SNR, mostly from the 15 Hz low-pass removing muscle/EMG noise
+      that the 40 Hz analysis band lets through, plus a little extra peak
+      from the lower high-pass. Worth having for a threshold-based detector,
+      but the analysis band is not unusable, and this is not the reason the
+      current amplitude thresholding performs poorly.
+
+   This point only CONSTRUCTS the channels and plots them for inspection
+   (ocular_channels.png). Point 10 uses them for detection.
+
+10. OCULAR-BASED ARTIFACT DETECTION WITH PER-PARTICIPANT THRESHOLDS
+    (--artifact-source eeg|ocular|both, default eeg = unchanged behaviour).
+
+    Two problems with the existing detector, both visible in real data:
+
+    a) It thresholds peak-to-peak amplitude on the EEG channels at a FIXED
+       500 uV for everyone. Ocular amplitude varies enormously between
+       people -- on session 20260806_125527 the derived blink channel has
+       std 28.8 uV for subject A and 93.1 uV for subject B, a 3x difference.
+       One fixed number either misses everything in the quieter participant
+       or rejects most of the louder one. On that session the 500 uV EEG
+       threshold rejects 0.3% of subject A while their blink channel shows
+       regular, obvious blinks throughout.
+
+    b) Peak-to-peak over a sliding window fires on anything large, so it
+       cannot distinguish a blink from a jaw clench from a cable tug. That
+       matters because the right response differs, and because it gives no
+       way to check whether the detector is finding what you think it is.
+
+    The fix is to detect on the derived ocular channels (point 9) instead,
+    with a threshold computed PER PARTICIPANT from their own data:
+
+        threshold = median(window p2p) + k * 1.4826 * MAD(window p2p)
+
+    MAD rather than sd because the artifacts themselves would inflate an sd
+    estimate and drag the threshold up above the very events it is meant to
+    catch. k is --ocular-k (default 5). Explicit per-subject overrides are
+    available (--blink-threshold-a/-b, --saccade-threshold-a/-b) for when
+    the automatic value is visibly wrong.
+
+    Two detectors run over the ocular channels (--ocular-detector):
+
+      ptp       sliding-window peak-to-peak, as before but on the ocular
+                channels and with a per-participant threshold. Catches
+                anything large.
+      velocity  thresholds |d/dt| of the blink channel and then keeps only
+                events lasting between --blink-min-dur and --blink-max-dur
+                (default 0.05-0.6s). This is the part that is specifically a
+                BLINK detector rather than a generic large-thing detector:
+                slow drift fails the velocity test, and sustained muscle
+                tone fails the duration test.
+
+    Both run by default ("both") and their masks are OR-ed: the velocity
+    detector adds blink specificity, the p2p detector keeps coverage of the
+    non-blink junk that a blink detector would ignore. Joint masking across
+    the dyad is unchanged -- a sample is used only if BOTH subjects are
+    clean at that moment.
+
+    --artifact-source stays at 'eeg' by default so this is opt-in and
+    directly comparable against the existing numbers. 'ocular' replaces the
+    EEG-amplitude criterion, 'both' ORs them.
+
+11. SELECTABLE ANALYSIS CHANNELS (--analysis-channels auto|all|frontal).
+    Which channels the CONNECTIVITY METRICS run on, as distinct from which
+    channels were recorded. Everything upstream -- referencing, bad-channel
+    detection, the derived ocular channels, artifact detection -- still uses
+    all four electrodes; only the PLV / circular-correlation step is
+    restricted.
+
+    This exists because of the reference artifact in point 8. Under a linked
+    mastoid reference, TP9 and TP10 become +(TP9-TP10)/2 and -(TP9-TP10)/2:
+    exact mirror images, correlation -1.000. Their cross-brain metrics are
+    then redundant by construction. Measured on a real dyad (20260811_113201,
+    --reference mastoid --analysis-channels all), the TP9 and TP10 ROWS of
+    the 4x4 matrix agree to 2e-16, and so do the columns, for BOTH metrics:
+    PLV and the adjusted circular correlation are each invariant to the pi
+    phase shift that separates the two channels, so the duplication is exact
+    rather than sign-flipped. Of the 16 cells only 9 are distinct -- 7 are
+    literal copies. Reporting "16 tests" under that reference therefore
+    overstates how many independent tests were run, which feeds straight
+    into the FDR correction of point 2. Only AF7 and AF8 carry independent
+    information there.
+
+    'auto' (the default) follows the reference: all four channels under
+    --reference average, AF7/AF8 under --reference mastoid. 'all' and
+    'frontal' force the choice either way, so the same recording can be run
+    both ways for comparison.
+
+    A useful side effect: restricting to the frontal pair drops the number
+    of cross-brain tests per band from 16 to 4, which is a real reduction in
+    the multiple-comparison burden (point 2) rather than a cosmetic one --
+    the discarded tests were the redundant ones.
+
+    The pair count is derived from the data everywhere it is reported, so
+    the significance counts and the FDR correction follow automatically.
+
+12. REGRESSION-BASED OCULAR CORRECTION (--ocular-correction regress),
+    the continuous form of Gratton, Coles & Donchin (1983).
+
+    WHY, in one number. Point 10's detector works -- it finds blinks at a
+    normal 7-39/min -- but masking what it finds cannot give long windows.
+    analyze_blink_ceiling.py measures the ceiling directly: masking ONLY
+    blinks, with no other criterion and no padding, still caps the longest
+    JOINTLY-clean stretch at 3.5-12.8s across our dyads (median 8.2s), even
+    though individual subjects have blink-free stretches up to 53s. The
+    usable mask is the INTERSECTION of two people's blink schedules, and at
+    a normal blink rate one of the two is essentially always blinking. Since
+    short windows inflate PLV badly (point 5: 0.286 at 2s vs 0.022 whole-
+    recording), masking trades one bias for another. Correcting the blink
+    and keeping the samples is the only route that preserves long windows.
+
+    HOW. For each EEG channel, fit
+
+        EEG_channel(t) = beta * ocular(t) + residual(t)
+
+    by least squares over the whole continuous recording, then subtract
+    beta * ocular(t). One coefficient per channel, no epoching required.
+
+    The MATLAB reference implementation (gratton_emcp.m) epochs the data
+    first, but that step exists to subtract the condition-average ERP before
+    estimating beta, so that stimulus-locked brain activity is not soaked up
+    into the regression weight. There is no ERP to protect in a continuous
+    connectivity analysis, so the epoching is unnecessary here and the
+    continuous fit is the simpler, more appropriate form.
+
+    AN HONEST CAVEAT ABOUT THIS MONTAGE. Classic Gratton regresses against a
+    DEDICATED EOG electrode, which is a separate sensor and therefore not a
+    linear combination of the EEG channels. The Muse has no such electrode,
+    so the regressor here is itself built from the same four electrodes
+    (point 9). Regressing it out is therefore a projection: it removes a
+    fixed one-dimensional spatial pattern from a four-dimensional channel
+    space. That is closer to removing one ICA component with a FIXED, chosen
+    topography than to classic Gratton -- with the advantage over ICA that
+    the topography is chosen on physiological grounds rather than estimated
+    from 4 channels, and the disadvantage that any brain signal sharing that
+    spatial pattern is removed along with the blink. It is not a free
+    correction, and it should not be described as equivalent to EOG-based
+    Gratton.
+
+    DEGENERACY GUARD. The regressors are linear combinations of the
+    electrodes, so with few enough channels they can span the whole space.
+    Under --reference mastoid the mastoids become mirror images and
+    mean(TP9', TP10') = 0, which makes
+
+        blink   = mean(AF7', AF8')
+        saccade = AF7' - AF8'
+
+    Those two together span exactly span{AF7', AF8'} -- so regressing BOTH
+    out of a frontal-only analysis set annihilates the data completely.
+    gratton_regress() checks the residual variance of every analysis channel
+    and refuses the correction if any channel loses essentially all of its
+    variance, rather than silently returning zeros. Use one regressor
+    (--regress-channels blink) with the frontal set, or keep all four
+    channels if you want both.
+
+    MEASURED OUTCOME on this data. The correction does what it was asked to
+    do for window length: on 20260806_125527 it took the jointly-clean
+    fraction from 91.3% to 95.0% and the longest continuous jointly-clean
+    run from 152s to 189s, where blink MASKING gave 10s (point 10). That is
+    the whole point of preferring regression, and it works.
+
+    But the caveat above is not hypothetical, and the numbers say how large
+    it is. The fitted betas come out at almost exactly the regressor's own
+    algebraic coefficients rather than at the artifact's propagation gains:
+
+        subject A, --regress-channels blink
+        fit on whole recording   TP9 -0.432  AF7 +0.551  AF8 +0.452  TP10 -0.571
+        fit on blink periods     TP9 -0.467  AF7 +0.536  AF8 +0.465  TP10 -0.534
+        algebraic d(blink)/d(ch) TP9 -0.5    AF7 +0.5    AF8 +0.5    TP10 -0.5
+
+    Those are the coefficients in the definition of the blink channel, not
+    a measurement of how a blink propagated. Restricting the fit to blink
+    periods -- the obvious remedy, since blinks are only ~2.5% of samples --
+    barely moves them, because the regressor bears the same fixed spatial
+    relationship to each channel during a blink as outside one.
+
+    The cost is correspondingly large. Splitting the variance reduction by
+    whether a blink was present (subject A):
+
+        channel   variance kept IN blinks   OUTSIDE blinks   ratio
+        TP9              26.7%                  71.0%         2.66
+        AF7              29.4%                  37.2%         1.26
+        AF8              40.6%                  47.8%         1.18
+        TP10             21.4%                  50.9%         2.38
+
+    Ratios above 1 mean the correction does preferentially remove
+    blink-time variance -- it is not pure shrinkage. But it also removes
+    29-63% of the variance at times when no blink is occurring, and for one
+    subject's TP10 the ratio was 0.75-1.00, i.e. no blink specificity at
+    all. On one channel the residual variance came out ABOVE 100%, meaning
+    the subtraction added signal rather than removing it.
+
+    THE FAITHFUL PROCEDURE WAS ALSO IMPLEMENTED (--ocular-correction emcp,
+    gratton_emcp / gratton_blink_mask), ported from gratton_emcp.m. It adds
+    the two things the simplified version above leaves out: Gratton's own
+    matched-filter blink detector, and SEPARATE propagation factors for
+    blink and non-blink samples applied piecewise. Two results:
+
+    a) The template detector is the better detector. It found 16.4 and 23.4
+       blinks/min on the two subjects of 20260806_125527, against 33/min for
+       the velocity detector of point 10 at k=5 -- i.e. squarely in the
+       normal 10-20/min range without per-subject tuning. Its shape is what
+       does it: the template responds only to a sustained deflection flanked
+       by baseline on both sides, so drift and steps score near zero however
+       large. If any part of this is worth keeping, it is this detector.
+
+    b) The two-regime structure -- the actual novelty of Gratton -- buys
+       nothing here. The blink-regime and saccade-regime factors come out
+       the same:
+
+           channel   blink<-vert  sacc<-vert   blink<-horiz  sacc<-horiz
+           AF7            0.501       0.503          0.501        0.504
+           AF8            0.500       0.504         -0.501       -0.505
+
+       They agree to ~0.003 because, as above, the coefficients are
+       structural rather than artifact-dependent, and the structure is the
+       same during a blink as outside one.
+
+    Worse, running it in its usual TWO-EOG configuration makes the
+    degeneracy sharply worse: with both derived regressors, AF7/AF8 retain
+    only 11-12% of their variance on one subject and the guard refuses the
+    correction outright on the other. The original assumes vertical and
+    horizontal EOG are separate sensors; ours are two linear combinations of
+    the same four electrodes, so together they span most of the space. Run
+    with --emcp-channels blink (the original's single-vertical-channel mode,
+    its example 5) it matches the simplified gratton_regress to within
+    rounding -- 95.0% clean, 189s longest run, same variance retained --
+    which is what a) and b) predict.
+
+    So the honest summary: with an independent EOG electrode this procedure
+    is correct and clean (verified in test_gratton_regression.py check 1,
+    where it recovers known gains to ~0.05 and drops artifact correlation
+    from 0.53 to 0.01). On the Muse's four electrodes, with the regressor
+    necessarily built from those same electrodes, it degenerates into
+    subtracting a fixed spatial projection. It buys the long windows that
+    masking cannot, at the price of a large amount of genuine signal. Which
+    trade is preferable is a judgement call about the specific analysis, not
+    something this file should decide -- hence --ocular-correction defaults
+    to none, and both paths are available for comparison.
 -----------------------------------------------------------------------------
 """
 import argparse
@@ -211,6 +535,7 @@ import glob
 import json
 import os
 import sys
+from collections import namedtuple
 from datetime import datetime
 
 import numpy as np
@@ -231,6 +556,69 @@ FREQ_BANDS = {
     "beta":  (13.0, 30.0),
 }
 
+# Pass band for the derived ocular channels (point 9). Deliberately lower
+# than the 1-40 Hz analysis band: blink energy is mostly below 3 Hz and the
+# analysis high-pass would throw most of it away.
+OCULAR_L_FREQ = 0.1
+OCULAR_H_FREQ = 15.0
+
+# Channels the connectivity metrics run on (point 11). Set once in main() via
+# set_analysis_channels(); everything upstream of the metrics keeps using all
+# four electrodes. Module-level because the plotting helpers need the labels
+# and threading them through four plot functions buys nothing.
+ANALYSIS_CH = list(CH_NAMES)
+
+
+def set_analysis_channels(names):
+    global ANALYSIS_CH
+    ANALYSIS_CH = list(names)
+
+
+def resolve_analysis_channels(selection, reference):
+    """
+    Which channels the metrics should use, given --analysis-channels and the
+    active reference. See point 11: under a linked-mastoid reference TP9 and
+    TP10 are mirror images of each other, so only the frontal pair carries
+    independent information.
+    """
+    if selection == "all":
+        return list(CH_NAMES)
+    if selection == "frontal":
+        return ["AF7", "AF8"]
+    return ["AF7", "AF8"] if reference == "mastoid" else list(CH_NAMES)
+
+
+def restrict_to_analysis(inst, analysis_ch, subject_label="", quiet=False):
+    """
+    Drop channels outside analysis_ch from a Raw or Epochs.
+
+    Channel names are subject-prefixed ("A_TP9"), so match on the suffix.
+    Called AFTER referencing, ocular-channel construction and artifact
+    detection, all of which need the full montage.
+    """
+    keep = [ch for ch in inst.ch_names if ch.split("_")[-1] in analysis_ch]
+    if not keep:
+        raise ValueError(
+            f"{subject_label}: no channels left after restricting to "
+            f"{analysis_ch} (have {inst.ch_names})")
+    if len(keep) == len(inst.ch_names):
+        return inst
+    dropped = [ch for ch in inst.ch_names if ch not in keep]
+    bad_kept = [ch for ch in keep if ch in inst.info["bads"]]
+    if not quiet:
+        print(f"     {subject_label}: metrics on {[c.split('_')[-1] for c in keep]} "
+              f"(dropped {[c.split('_')[-1] for c in dropped]})")
+        if bad_kept:
+            print(f"     {subject_label}: WARNING analysis channel(s) "
+                  f"{[c.split('_')[-1] for c in bad_kept]} are flagged bad -- "
+                  "the metrics for this subject rest on unreliable data")
+    return inst.copy().pick(keep)
+
+# saccade/blink traces in uV, plus the band they were built in. Either trace
+# may be None when the electrodes it needs were flagged bad.
+OcularChannels = namedtuple(
+    "OcularChannels", "saccade blink fs l_freq h_freq label")
+
 
 # ============================================================
 # 1. LOADING
@@ -244,7 +632,12 @@ def load_stimulus_onset(csv_path):
     sidecar = csv_path.replace(".csv", "_markers.json")
     if not os.path.exists(sidecar):
         return None
-    with open(sidecar) as f:
+    # utf-8-sig, not utf-8: some sidecars were written with a BOM, which
+    # json.load rejects outright. That silently crashed the whole run for
+    # any such session (20260729_220724 was excluded from every comparison
+    # table this way before it was noticed), so decode the BOM rather than
+    # die on it.
+    with open(sidecar, encoding="utf-8-sig") as f:
         markers = json.load(f)
     for m in markers:
         if "stimulus" in m.get("marker", "").lower():
@@ -386,7 +779,9 @@ def remove_blink_component(raw, subject_label, random_state=42):
     return raw_clean
 
 
-def detect_bad_channels(raw, railed_uv=990.0, railed_frac_thresh=0.02, flat_std_uv=5.0):
+def detect_bad_channels(raw, railed_uv=990.0, railed_frac_thresh=0.02, flat_std_uv=5.0,
+                        strict_channels=(), strict_railed_frac_thresh=0.005,
+                        strict_flat_std_uv=8.0):
     """
     Flag channels that are chronically railed (stuck near the Muse's ADC
     limit -- poor scalp contact or motion) or abnormally flat (near-zero
@@ -398,44 +793,251 @@ def detect_bad_channels(raw, railed_uv=990.0, railed_frac_thresh=0.02, flat_std_
     is well below typical scalp EEG (tens of uV), so it only catches
     channels that are essentially dead, not just quiet.
 
+    strict_channels holds channels that are about to be used AS THE
+    REFERENCE (the mastoids, under --reference mastoid). Those get tighter
+    thresholds, because a bad reference channel does not merely make itself
+    unusable -- it subtracts its own noise into EVERY other channel for that
+    subject. A mildly flaky mastoid would pass the ordinary gate and quietly
+    contaminate the whole montage, so it is worth catching earlier than a
+    mildly flaky AF7 would be.
+
     Returns a list of channel names to mark bad.
     """
     data_uv = raw.get_data(picks="eeg") * 1e6
     bad = []
     for ch_name, ch_data in zip(raw.ch_names, data_uv):
+        is_strict = ch_name in strict_channels
+        railed_thresh = strict_railed_frac_thresh if is_strict else railed_frac_thresh
+        flat_thresh = strict_flat_std_uv if is_strict else flat_std_uv
+        note = "  [reference channel: strict threshold]" if is_strict else ""
         railed_frac = float((np.abs(ch_data) >= railed_uv).mean())
         std_uv = float(ch_data.std())
-        if railed_frac > railed_frac_thresh:
+        if railed_frac > railed_thresh:
             print(f"     {ch_name}: railed {railed_frac:.1%} of samples "
-                  f"(>= {railed_uv:.0f} uV) -- marking bad")
+                  f"(>= {railed_uv:.0f} uV) -- marking bad{note}")
             bad.append(ch_name)
-        elif std_uv < flat_std_uv:
+        elif std_uv < flat_thresh:
             print(f"     {ch_name}: abnormally flat (std={std_uv:.1f} uV, "
-                  f"< {flat_std_uv:.0f} uV) -- marking bad")
+                  f"< {flat_thresh:.0f} uV) -- marking bad{note}")
             bad.append(ch_name)
     return bad
 
 
-def preprocess(raw, l_freq=1.0, h_freq=40.0, use_ica=False, subject_label=""):
+def mastoid_channels(raw):
+    """This subject's mastoid channels (TP9, TP10), in that order.
+
+    Channel names are subject-prefixed ('A_TP9'), so match on the suffix.
+    Returns whichever of the two are actually present.
     """
-    Bandpass + optional ICA blink removal + average reference.
+    out = []
+    for suffix in ("TP9", "TP10"):
+        out += [ch for ch in raw.ch_names if ch.split("_")[-1] == suffix]
+    return out
+
+
+def longest_clean_run_s(good_mask, fs):
+    """Longest run of consecutive True samples in good_mask, in seconds.
+
+    Reported alongside overall clean fraction because they answer different
+    questions: clean fraction says how much data survived, this says whether
+    it survived in usable-length pieces. Two recordings can both be 60%
+    clean while one has a single 100s stretch and the other has a hundred
+    0.6s crumbs -- and short windows systematically inflate PLV (see point
+    5), so the second is far worse than the fraction alone suggests.
+    """
+    good = np.asarray(good_mask, dtype=bool)
+    if not good.any():
+        return 0.0
+    # run lengths via the positions where the mask changes value
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], good.view(np.int8), [0]))))
+    return float((edges[1::2] - edges[0::2]).max()) / fs
+
+
+def make_ocular_channels(raw, l_freq=OCULAR_L_FREQ, h_freq=OCULAR_H_FREQ,
+                         subject_label="", bads=()):
+    """
+    Build bipolar ocular channels from the four Muse electrodes:
+
+        saccade = AF7 - AF8                          (horizontal eye movement)
+        blink   = mean(AF7, AF8) - mean(TP9, TP10)   (vertical / blink)
+
+    See point 9 of the module docstring. Takes the RAW (unfiltered) signal,
+    because it applies its own lower-frequency pass band -- do not hand it
+    the output of preprocess(), which has already high-passed at 1 Hz and
+    discarded most of the blink amplitude.
+
+    bads is the list of channels flagged unusable (typically
+    raw_pp.info["bads"]). A derived channel whose electrodes are bad is
+    returned as None rather than as a plausible-looking trace built from a
+    dead electrode.
+
+    Returns an OcularChannels namedtuple; .saccade and .blink are arrays in
+    microvolts, or None.
+    """
+    idx = {ch.split("_")[-1]: i for i, ch in enumerate(raw.ch_names)}
+    bad_short = {ch.split("_")[-1] for ch in bads}
+    sfreq = raw.info["sfreq"]
+
+    # A 0.1 Hz high-pass needs an FIR filter roughly 33s long, so short
+    # recordings cannot support it. MNE does not RAISE on this -- it emits a
+    # RuntimeWarning ("filter_length is longer than the signal, distortion is
+    # likely") and filters anyway, which would silently hand back a distorted
+    # blink channel. So check the length up front and step the high-pass up
+    # instead; a 0.5 Hz blink channel is still usable, and the caller is told
+    # which band was actually used.
+    filt, used_l = None, l_freq
+    for candidate in (l_freq, 0.5, 1.0):
+        if candidate is None or candidate <= 0:
+            continue
+        # MNE's 'auto' FIR length: 3.3 / transition-bandwidth seconds, with
+        # l_trans_bandwidth = min(max(l_freq * 0.25, 2.0), l_freq)
+        trans = min(max(candidate * 0.25, 2.0), candidate)
+        if 3.3 / trans * sfreq > raw.n_times:
+            continue
+        try:
+            filt = raw.copy().filter(l_freq=candidate, h_freq=h_freq,
+                                     picks="eeg", verbose=False)
+            used_l = candidate
+            break
+        except ValueError:
+            continue
+    if filt is None:
+        print(f"     {subject_label}: ocular channels unavailable -- "
+              f"recording too short to high-pass ({raw.n_times} samples)")
+        return OcularChannels(None, None, raw.info["sfreq"], l_freq, h_freq,
+                              subject_label)
+    if used_l != l_freq:
+        print(f"     {subject_label}: ocular high-pass raised "
+              f"{l_freq} -> {used_l} Hz (recording too short for "
+              f"{l_freq} Hz)")
+
+    data = filt.get_data(picks="eeg") * 1e6
+
+    def get(name):
+        return data[idx[name]] if name in idx else None
+
+    af7, af8 = get("AF7"), get("AF8")
+    tp9, tp10 = get("TP9"), get("TP10")
+
+    saccade = None
+    if af7 is not None and af8 is not None and not ({"AF7", "AF8"} & bad_short):
+        saccade = af7 - af8
+    else:
+        print(f"     {subject_label}: no saccade channel -- AF7/AF8 missing "
+              f"or flagged bad")
+
+    blink = None
+    frontal = [x for x, n in ((af7, "AF7"), (af8, "AF8"))
+               if x is not None and n not in bad_short]
+    mastoid = [x for x, n in ((tp9, "TP9"), (tp10, "TP10"))
+               if x is not None and n not in bad_short]
+    if frontal and mastoid:
+        # A single good mastoid still gives a usable (if laterally biased)
+        # vertical channel, so fall back to it rather than dropping the
+        # blink channel entirely.
+        blink = np.mean(frontal, axis=0) - np.mean(mastoid, axis=0)
+        if len(mastoid) == 1 or len(frontal) == 1:
+            print(f"     {subject_label}: blink channel built from "
+                  f"{len(frontal)} frontal / {len(mastoid)} mastoid "
+                  "electrode(s) -- reduced quality")
+    else:
+        print(f"     {subject_label}: no blink channel -- needs at least one "
+              "good frontal AND one good mastoid electrode")
+
+    for name, trace in (("saccade", saccade), ("blink", blink)):
+        if trace is not None:
+            print(f"     {subject_label}: {name:8s} std={trace.std():6.1f} uV  "
+                  f"p99|x|={np.percentile(np.abs(trace), 99):7.1f} uV  "
+                  f"range={trace.min():.0f}..{trace.max():.0f} uV")
+
+    return OcularChannels(saccade, blink, filt.info["sfreq"], used_l, h_freq,
+                          subject_label)
+
+
+def preprocess(raw, l_freq=1.0, h_freq=40.0, use_ica=False, subject_label="",
+               reference="average"):
+    """
+    Bandpass + optional ICA blink removal + re-reference.
+
+    reference="average" (default): common average over that subject's good
+    channels. reference="mastoid": linked mastoid, i.e. every channel minus
+    mean(TP9, TP10). See point 8 of the module docstring for why the choice
+    matters -- in short, the Muse's online reference is FPZ, which sits over
+    the eyes and injects ocular activity into all four channels as common
+    mode. Both options cancel FPZ, but the mastoid option leaves the frontal
+    channels far less mixed into each other than a 4-electrode average does.
 
     Bad channels (see detect_bad_channels) are excluded from the reference
-    computation -- a chronically railed or dead channel would otherwise
-    drag the shared average down (or up) with it and contaminate the other
-    3, otherwise-good, channels for that subject.
+    computation -- a chronically railed or dead channel would otherwise drag
+    the shared reference around and contaminate the other, otherwise good,
+    channels for that subject.
     """
     raw = raw.copy()
-    bad_chs = detect_bad_channels(raw)
+    strict = mastoid_channels(raw) if reference == "mastoid" else ()
+    bad_chs = detect_bad_channels(raw, strict_channels=strict)
     raw.info["bads"] = bad_chs
     raw.filter(l_freq=l_freq, h_freq=h_freq, picks="eeg", verbose=False)
     if use_ica:
         raw = remove_blink_component(raw, subject_label)
+
+    if reference == "mastoid":
+        mastoids = mastoid_channels(raw)
+        ref_chs = [ch for ch in mastoids if ch not in raw.info["bads"]]
+        dropped = [ch for ch in mastoids if ch in raw.info["bads"]]
+        if len(ref_chs) == 2:
+            print(f"     {subject_label}: linked-mastoid reference {ref_chs}")
+            # X - mean(TP9, TP10) makes TP9 and TP10 into +(TP9-TP10)/2 and
+            # -(TP9-TP10)/2: exact mirror images. Their cross-brain metrics
+            # are therefore redundant by construction (identical up to sign),
+            # so only AF7/AF8 carry independent information here.
+            print(f"     {subject_label}: note -- TP9/TP10 are now mirror "
+                  "images of each other (an artefact of being the "
+                  "reference); only AF7/AF8 carry independent information "
+                  "under this reference")
+        elif len(ref_chs) == 1:
+            print(f"     {subject_label}: WARNING only one usable mastoid "
+                  f"({dropped} flagged bad) -- referencing to {ref_chs[0]} "
+                  "alone. A single-mastoid reference is laterally biased; "
+                  "treat this subject's values as suspect.")
+        else:
+            print(f"     {subject_label}: WARNING both mastoids {mastoids} "
+                  "flagged bad -- mastoid reference unavailable, falling "
+                  "back to an average reference over good channels")
+
+        # MNE applies the reference to the GOOD channels only, and raises if
+        # there are none -- which happens when every channel is already
+        # flagged bad. Check before asking, so a hopeless subject warns and
+        # returns instead of killing the run.
+        receivers = [ch for ch in raw.ch_names if ch not in raw.info["bads"]]
+        if ref_chs and receivers:
+            raw.set_eeg_reference(ref_channels=ref_chs, projection=False,
+                                  verbose=False)
+            if len(ref_chs) == 1:
+                # X - X is identically zero, so a single reference channel
+                # carries no signal after referencing. Flag it AFTER the
+                # reference is applied (flagging it first would remove it
+                # from the receiver set and can leave MNE nothing to
+                # reference) so nothing downstream mistakes a flat trace for
+                # real data.
+                raw.info["bads"] = raw.info["bads"] + [ref_chs[0]]
+            return raw
+        if ref_chs and not receivers:
+            print(f"     {subject_label}: WARNING all channels flagged bad "
+                  f"({raw.info['bads']}) -- leaving data unreferenced; this "
+                  "subject has no usable data")
+            return raw
+        # else (no usable mastoid): fall through to the average branch below
+
     good_chs = [ch for ch in raw.ch_names if ch not in raw.info["bads"]]
     if not good_chs:
-        print(f"     {subject_label}: WARNING all channels flagged bad -- "
-              "falling back to plain average reference")
-        raw.set_eeg_reference("average", projection=False, verbose=False)
+        # MNE raises ("No channels supplied to apply the reference to") if
+        # every channel is bad, so don't ask it to. Nothing usable survives
+        # this subject anyway -- leave the data unreferenced and let the
+        # downstream artifact/epoch stage report the empty result, rather
+        # than crashing the whole run here.
+        print(f"     {subject_label}: WARNING all channels flagged bad "
+              f"({bad_chs}) -- leaving data unreferenced; this subject has "
+              "no usable data")
     else:
         if bad_chs:
             print(f"     {subject_label}: referencing to good channels only "
@@ -446,6 +1048,335 @@ def preprocess(raw, l_freq=1.0, h_freq=40.0, use_ica=False, subject_label=""):
         # unreliable downstream)
         raw.set_eeg_reference(ref_channels=good_chs, projection=False, verbose=False)
     return raw
+
+
+def gratton_regress(raw, oc, regressors=("blink",), l_freq=1.0, h_freq=40.0,
+                    subject_label="", min_variance_kept=0.10, quiet=False,
+                    fit_on="blinks", fit_mask=None, k=10.0):
+    """
+    Regression-based ocular correction, continuous (non-epoched) form of
+    Gratton, Coles & Donchin (1983). See point 12 of the module docstring,
+    including the caveat that on this montage the regressor is derived from
+    the same electrodes it corrects.
+
+    raw must already be preprocessed (referenced and band-passed); oc is the
+    OcularChannels for the same subject. The regressors are re-filtered to
+    the raw's own band before fitting, so the subtraction cannot introduce
+    out-of-band content that the analysis signal does not contain.
+
+    fit_on selects WHERE beta is estimated, which matters far more than it
+    might seem. Blinks occupy only ~2.5% of a typical recording here, so a
+    fit over the whole recording is dominated by the 97.5% of the time when
+    the "regressor" is simply a linear combination of ongoing brain signal.
+    The resulting beta then measures the STRUCTURAL projection of one linear
+    combination of the electrodes onto another, and subtracting it strips
+    out that structural component everywhere -- measured on a real subject,
+    a whole-recording fit removed 29-63% of the variance OUTSIDE any blink.
+
+    fit_on="blinks" (default) estimates beta only on samples where the
+    velocity detector (point 10) found a blink, so the fit is dominated by
+    the artifact rather than by ongoing EEG, and applies that beta to the
+    whole recording. This is the intent of the original Gratton procedure,
+    where the EOG channel is a separate electrode and its variance is
+    artifact-dominated by construction. fit_on="all" restores the naive
+    whole-recording fit for comparison. fit_mask overrides the automatic
+    blink detection with an explicit boolean mask.
+
+    Refuses the correction (returns the input unchanged, with ok=False) if
+    any channel would be left with less than min_variance_kept of its
+    original variance -- the degeneracy described in point 12. The default
+    is 10%, not something nearer zero: in the fully degenerate case
+    (mastoid reference, both regressors) the residual does not land at
+    exactly 0% because the regressors are re-filtered to the analysis band
+    before fitting, so a little out-of-band variance survives the
+    projection. Measured on synthetic data that case leaves about 6%, which
+    a 2% bar would wave through.
+
+    Returns (raw_corrected, info) where info carries the per-channel betas,
+    the variance retained per channel, and whether the correction was applied.
+    """
+    available = {"blink": oc.blink, "saccade": oc.saccade}
+    names = [n for n in regressors if available.get(n) is not None]
+    missing = [n for n in regressors if available.get(n) is None]
+    info = {"applied": False, "regressors": names, "missing": missing,
+            "betas": {}, "variance_kept": {}}
+    if not names:
+        if not quiet:
+            print(f"     {subject_label}: no ocular regressor available "
+                  f"({missing} unavailable) -- regression skipped")
+        return raw, info
+
+    n = raw.n_times
+    sfreq = raw.info["sfreq"]
+    # regressors in volts, truncated/padded to the EEG length
+    X = np.zeros((n, len(names)))
+    for j, name in enumerate(names):
+        trace = np.asarray(available[name], dtype=float) * 1e-6
+        m = min(n, len(trace))
+        X[:m, j] = trace[:m]
+    # match the analysis band: the ocular channels were built in 0.1-15 Hz
+    # (point 9), and subtracting a component the EEG cannot contain would
+    # inject out-of-band signal rather than remove artifact
+    X = mne.filter.filter_data(X.T.copy(), sfreq, l_freq, h_freq,
+                               verbose=False).T
+
+    Y = raw.get_data().T                      # (n_samples, n_channels)
+    Xc = X - X.mean(axis=0, keepdims=True)
+    Yc = Y - Y.mean(axis=0, keepdims=True)
+
+    # where to ESTIMATE beta (it is APPLIED everywhere either way)
+    if fit_mask is not None:
+        fit = np.asarray(fit_mask, dtype=bool)[:n]
+    elif fit_on == "blinks" and oc.blink is not None:
+        thr = ocular_thresholds(oc, k=k)["blink_velocity"]
+        fit, n_blinks, _ = velocity_event_mask(oc.blink, oc.fs, thr)
+        fit = fit[:n] if len(fit) >= n else np.pad(fit, (0, n - len(fit)))
+        info["n_blinks_fit"] = n_blinks
+    else:
+        fit = np.ones(n, dtype=bool)
+    if fit.sum() < 10 * max(1, len(names)):
+        if not quiet:
+            print(f"     {subject_label}: only {int(fit.sum())} samples to fit "
+                  "beta on -- falling back to a whole-recording fit")
+        fit = np.ones(n, dtype=bool)
+    info["fit_on"] = fit_on
+    info["fit_samples"] = int(fit.sum())
+    info["fit_fraction"] = float(fit.mean())
+
+    beta, *_ = np.linalg.lstsq(Xc[fit], Yc[fit], rcond=None)  # (n_reg, n_chan)
+    residual = Yc - Xc @ beta
+
+    var_before = Yc.var(axis=0)
+    var_after = residual.var(axis=0)
+    kept = np.divide(var_after, var_before,
+                     out=np.ones_like(var_after), where=var_before > 0)
+
+    for i, ch in enumerate(raw.ch_names):
+        info["betas"][ch] = {names[j]: float(beta[j, i]) for j in range(len(names))}
+        info["variance_kept"][ch] = float(kept[i])
+
+    annihilated = [ch for ch, k in info["variance_kept"].items()
+                   if k < min_variance_kept]
+    if annihilated:
+        if not quiet:
+            print(f"     {subject_label}: REFUSING regression -- "
+                  f"{annihilated} would lose >"
+                  f"{100 * (1 - min_variance_kept):.0f}% of their variance. "
+                  f"The regressors {names} span the channel space (point 12); "
+                  "use --regress-channels blink, or keep all four channels.")
+        return raw, info
+
+    out = raw.copy()
+    out._data = (residual + Y.mean(axis=0, keepdims=True)).T
+    info["applied"] = True
+    if not quiet:
+        where = (f"beta fit on {info['fit_samples']} blink samples "
+                 f"({100 * info['fit_fraction']:.1f}% of the recording)"
+                 if fit_on == "blinks" and fit.mean() < 1.0
+                 else "beta fit on the whole recording")
+        print(f"     {subject_label}: regressed out {names}, {where}")
+        print(f"     {subject_label}: variance kept "
+              + "  ".join(f"{ch.split('_')[-1]}={100 * info['variance_kept'][ch]:.0f}%"
+                          for ch in raw.ch_names))
+        if missing:
+            print(f"     {subject_label}: note -- {missing} unavailable, "
+                  "not regressed")
+    return out, info
+
+
+def gratton_blink_mask(trace, sfreq, criterion=14.0, wind_variance=2.0):
+    """
+    Gratton's own blink detector, ported from gratton_emcp.m.
+
+    A matched filter rather than an amplitude or velocity threshold: the
+    vertical-EOG trace is correlated with a three-part step template
+    [-1 x (third+1), +2 x third, -1 x (third-1)] spanning 210ms, where
+    `third` is 70ms worth of samples forced odd. The "slope" statistic is
+    that correlation divided by wind_variance**2, and any centre point whose
+    |slope| exceeds `criterion` marks +/- (middle-1) samples around it as
+    blink.
+
+    The shape is what makes it selective: it responds to a sustained
+    deflection flanked by baseline on BOTH sides, so a step or a drift
+    scores near zero even when large, and only a bump of roughly blink
+    duration scores highly. Note the template is deliberately asymmetric
+    (third+1 vs third-1) -- that is how the original is written, and it is
+    kept here so the port stays faithful.
+
+    criterion=14.0 and wind_variance=2.0 are the original's constants, which
+    assume data in microvolts.
+
+    Returns (mask, n_events).
+    """
+    trace = np.asarray(trace, dtype=float)
+    n = len(trace)
+    ms_ten = int(round(10.0 / (1000.0 / sfreq) + 0.5))
+    third = ms_ten * 7
+    if third % 2 == 0:
+        third += 1
+    middle = (third + 1) // 2
+    length = third * 3
+    mark = np.zeros(n, dtype=bool)
+    if n < length + 2 * middle:
+        return mark, 0
+
+    template = np.concatenate([-np.ones(third + 1),
+                               2.0 * np.ones(third),
+                               -np.ones(third - 1)])
+    # out[s] = sum(trace[s:s+length] * template); the window centred on that
+    # correlation sits at s + third + middle - 1
+    out = np.correlate(trace, template, mode="valid") / float(length)
+    slope = out / (wind_variance ** 2)
+    centres = np.flatnonzero(np.abs(slope) > criterion) + third + middle - 1
+
+    n_events = 0
+    prev_end = -1
+    for c in centres:
+        lo, hi = max(0, c - middle + 1), min(n, c + middle)
+        mark[lo:hi] = True
+        if lo > prev_end:          # count contiguous groups, not samples
+            n_events += 1
+        prev_end = max(prev_end, hi)
+    return mark, n_events
+
+
+def gratton_emcp(raw, oc, l_freq=1.0, h_freq=40.0, subject_label="",
+                 criterion=14.0, min_variance_kept=0.10, quiet=False,
+                 channels="blink"):
+    """
+    Gratton, Coles & Donchin (1983) eye-movement correction, ported from
+    gratton_emcp.m (Gehring's EEGLAB implementation) to continuous data.
+
+    Differences from gratton_regress() -- which is the simplified version --
+    are the two that matter in the original:
+
+      1. TWO sets of propagation factors, not one. The recording is split
+         into blink and non-blink ("saccade") samples by the template
+         detector above, and a separate no-intercept regression is run on
+         each. Correction is then applied PIECEWISE: blink samples get
+         PropBlink, everything else gets PropSaccade. The rationale is that
+         a blink and a saccade propagate to the scalp differently, so one
+         coefficient cannot describe both.
+      2. Means are removed WITHIN each regime before fitting, and the
+         regime's own mean is added back into the subtraction, rather than
+         one grand mean over the whole recording.
+
+    Dropped from the original, deliberately: the selection-card machinery
+    that subtracts each condition's average ERP before fitting. That step
+    exists to stop stimulus-locked brain activity being absorbed into the
+    propagation factors; a continuous connectivity analysis has no ERP to
+    protect, so the whole-recording mean is removed instead. This is what
+    makes the procedure work without epoching -- the epoching in the MATLAB
+    version is a carrier for the ERP subtraction, not a requirement of the
+    regression.
+
+    channels="both" uses vertical and horizontal EOG, as the original's
+    usual configuration does; channels="blink" uses the vertical channel
+    alone, which the original also supports (its example 5: "correct for a
+    single EOG channel ... corrects only blinks and vertical EOG"). On this
+    montage the single-channel form is the safer default, because both
+    derived regressors are linear combinations of the same four electrodes
+    and using both together strips most of the frontal variance -- see the
+    degeneracy discussion in point 12.
+
+    Returns (raw, info) where info mirrors the MATLAB EEG.emcp structure.
+    """
+    info = {"applied": False, "blink_factors": {}, "saccade_factors": {},
+            "variance_kept": {}, "n_blink_events": 0}
+    if oc.blink is None:
+        if not quiet:
+            print(f"     {subject_label}: EMCP needs a vertical (blink) "
+                  "channel -- unavailable, skipped")
+        return raw, info
+
+    n = raw.n_times
+    sfreq = raw.info["sfreq"]
+    names = ["blink"]
+    if channels == "both" and oc.saccade is not None:
+        names.append("saccade")
+    X = np.zeros((n, len(names)))
+    for j, nm in enumerate(names):
+        tr = np.asarray(getattr(oc, nm), dtype=float)
+        m = min(n, len(tr))
+        X[:m, j] = tr[:m]
+    X = mne.filter.filter_data(X.T.copy(), sfreq, l_freq, h_freq,
+                               verbose=False).T
+
+    # blink/saccade split, on the vertical channel, per the original
+    is_blink, n_events = gratton_blink_mask(X[:, 0], sfreq, criterion=criterion)
+    info["n_blink_events"] = n_events
+    info["blink_fraction"] = float(is_blink.mean())
+    n_b, n_s = int(is_blink.sum()), int((~is_blink).sum())
+    if not quiet:
+        print(f"     {subject_label}: EMCP template found {n_events} blinks "
+              f"({100 * is_blink.mean():.1f}% of samples; "
+              f"{60 * n_events / (n / sfreq):.1f}/min)")
+
+    Y = raw.get_data().T * 1e6                       # uV, as the original
+    # whole-recording mean removal stands in for the epoch-mean step
+    Xc = X - X.mean(axis=0, keepdims=True)
+    Yc = Y - Y.mean(axis=0, keepdims=True)
+
+    def fit(mask):
+        """No-intercept least squares on one regime, means removed within it."""
+        if mask.sum() <= len(names):
+            return None
+        xb = Xc[mask] - Xc[mask].mean(axis=0, keepdims=True)
+        yb = Yc[mask] - Yc[mask].mean(axis=0, keepdims=True)
+        beta, *_ = np.linalg.lstsq(xb, yb, rcond=None)
+        return beta
+
+    prop_blink = fit(is_blink) if n_b > 0 else None
+    prop_sacc = fit(~is_blink)
+    if prop_sacc is None:
+        if not quiet:
+            print(f"     {subject_label}: EMCP has too few non-blink samples "
+                  "to fit -- skipped")
+        return raw, info
+    if prop_blink is None and not quiet:
+        print(f"     {subject_label}: EMCP found no blinks -- all data "
+              "treated as saccade, as the original does")
+
+    corrected = Yc.copy()
+    for mask, prop in ((is_blink, prop_blink), (~is_blink, prop_sacc)):
+        if prop is None or not mask.any():
+            continue
+        # subtract the propagated DEVIATION from this regime's mean, then the
+        # regime's own channel mean -- the original's
+        # EEG - (Prop*(EOG - EOGmean) + EEGmean)
+        x_mean = Xc[mask].mean(axis=0, keepdims=True)
+        y_mean = Yc[mask].mean(axis=0, keepdims=True)
+        corrected[mask] -= (Xc[mask] - x_mean) @ prop + y_mean
+
+    var_before, var_after = Yc.var(axis=0), corrected.var(axis=0)
+    kept = np.divide(var_after, var_before,
+                     out=np.ones_like(var_after), where=var_before > 0)
+    for i, ch in enumerate(raw.ch_names):
+        info["variance_kept"][ch] = float(kept[i])
+        if prop_blink is not None:
+            info["blink_factors"][ch] = {names[j]: float(prop_blink[j, i])
+                                         for j in range(len(names))}
+        info["saccade_factors"][ch] = {names[j]: float(prop_sacc[j, i])
+                                       for j in range(len(names))}
+
+    annihilated = [ch for ch, k in info["variance_kept"].items()
+                   if k < min_variance_kept]
+    if annihilated:
+        if not quiet:
+            print(f"     {subject_label}: REFUSING EMCP -- {annihilated} "
+                  f"would lose >{100 * (1 - min_variance_kept):.0f}% of their "
+                  "variance (see point 12 on regressor degeneracy)")
+        return raw, info
+
+    out = raw.copy()
+    out._data = (corrected + Y.mean(axis=0, keepdims=True)).T * 1e-6
+    info["applied"] = True
+    if not quiet:
+        print(f"     {subject_label}: EMCP corrected using {names}, "
+              "variance kept "
+              + "  ".join(f"{ch.split('_')[-1]}={100 * info['variance_kept'][ch]:.0f}%"
+                          for ch in raw.ch_names))
+    return out, info
 
 
 def epoch_with_gap_rejection(raw, epoch_len_s, overlap_s, amplitude_uv=150.0):
@@ -471,7 +1402,7 @@ def epoch_with_gap_rejection(raw, epoch_len_s, overlap_s, amplitude_uv=150.0):
 
 def load_and_epoch_subject(csv_path, subject_label, epoch_len_s, overlap_s,
                             h_freq=40.0, amplitude_uv=150.0, use_ica=False,
-                            align_onset=True, quiet=False):
+                            align_onset=True, quiet=False, reference="average"):
     """
     Full load -> preprocess -> epoch chain for ONE subject's CSV.
 
@@ -494,7 +1425,8 @@ def load_and_epoch_subject(csv_path, subject_label, epoch_len_s, overlap_s,
 
     nyq = fs / 2
     h_freq_eff = min(h_freq, nyq * 0.95)
-    raw_pp = preprocess(raw, h_freq=h_freq_eff, use_ica=use_ica, subject_label=subject_label)
+    raw_pp = preprocess(raw, h_freq=h_freq_eff, use_ica=use_ica,
+                        subject_label=subject_label, reference=reference)
     epochs = epoch_with_gap_rejection(raw_pp, epoch_len_s, overlap_s,
                                        amplitude_uv=amplitude_uv)
     if len(epochs) == 0:
@@ -517,13 +1449,180 @@ def load_and_epoch_subject(csv_path, subject_label, epoch_len_s, overlap_s,
 # the same instant), and the connectivity stats run on whatever continuous
 # good data is left -- no arbitrary epoch boundaries at all.
 
-def continuous_bad_mask(raw, window_s=0.5, step_s=0.1, threshold_uv=500.0, pad_s=0.3):
+def mask_runs(mask):
+    """[(start, end_exclusive), ...] for each run of True in a boolean mask."""
+    m = np.asarray(mask, dtype=bool)
+    if not m.any():
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], m.view(np.int8), [0]))))
+    return list(zip(edges[0::2], edges[1::2]))
+
+
+def robust_threshold(values, k=5.0):
+    """median + k * MAD, with MAD scaled to standard-deviation units.
+
+    MAD rather than standard deviation because the artifacts we are trying
+    to detect are themselves part of `values`, and would inflate an sd
+    estimate enough to push the threshold above the events it is supposed to
+    catch. The median/MAD pair is dominated by the quiet majority of the
+    recording instead, which is what we want the threshold measured against.
+    """
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return np.inf
+    med = float(np.median(values))
+    mad = float(np.median(np.abs(values - med)))
+    return med + k * 1.4826 * mad
+
+
+def window_ptp(trace, sfreq, window_s=0.5, step_s=0.1):
+    """Sliding-window peak-to-peak. Returns (starts, ends, values)."""
+    n = len(trace)
+    win_n = max(1, int(round(window_s * sfreq)))
+    step_n = max(1, int(round(step_s * sfreq)))
+    starts = list(range(0, max(1, n - win_n + 1), step_n))
+    last_start = max(0, n - win_n)
+    if not starts or starts[-1] != last_start:
+        starts.append(last_start)
+    ends, values = [], []
+    for s in starts:
+        e = min(s + win_n, n)
+        seg = trace[s:e]
+        ends.append(e)
+        values.append(float(seg.max() - seg.min()) if e > s else 0.0)
+    return np.array(starts), np.array(ends), np.array(values)
+
+
+def ptp_event_mask(trace, sfreq, threshold, window_s=0.5, step_s=0.1):
+    """Samples covered by any window whose peak-to-peak exceeds threshold."""
+    starts, ends, values = window_ptp(trace, sfreq, window_s, step_s)
+    bad = np.zeros(len(trace), dtype=bool)
+    for s, e, v in zip(starts, ends, values):
+        if v > threshold:
+            bad[s:e] = True
+    return bad
+
+
+def velocity_event_mask(trace, sfreq, threshold, min_dur_s=0.05,
+                        max_dur_s=0.6, merge_gap_s=0.15):
+    """
+    Blink detector: fast deflection of a plausible duration.
+
+    Thresholds |d/dt| rather than amplitude, then keeps only events lasting
+    between min_dur_s and max_dur_s. A blink produces two velocity
+    excursions close together (the fast closing and the slower reopening),
+    so runs separated by less than merge_gap_s are merged before the
+    duration test.
+
+    This is what makes it a BLINK detector rather than a large-thing
+    detector: slow drift never exceeds the velocity threshold, and sustained
+    muscle tone fails the duration test. Returns (mask, n_kept, n_candidates).
+    """
+    if len(trace) < 2:
+        return np.zeros(len(trace), dtype=bool), 0, 0
+    velocity = np.abs(np.diff(trace, prepend=trace[0])) * sfreq  # uV/s
+    hot = velocity > threshold
+    gap_n = int(round(merge_gap_s * sfreq))
+
+    merged = []
+    for s, e in mask_runs(hot):
+        if merged and s - merged[-1][1] <= gap_n:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+
+    out = np.zeros(len(trace), dtype=bool)
+    kept = 0
+    for s, e in merged:
+        if min_dur_s <= (e - s) / sfreq <= max_dur_s:
+            out[s:e] = True
+            kept += 1
+    return out, kept, len(merged)
+
+
+def ocular_thresholds(oc, window_s=0.5, step_s=0.1, k=5.0,
+                      blink_override=None, saccade_override=None):
+    """
+    Per-participant detection thresholds derived from that subject's own
+    ocular channels (point 10). Returns a dict with 'blink'/'saccade'
+    amplitude thresholds in uV and 'blink_velocity' in uV/s; entries are
+    None where the channel is unavailable. Overrides bypass the estimate.
+    """
+    out = {"blink": None, "saccade": None, "blink_velocity": None}
+    for name, trace, override in (("blink", oc.blink, blink_override),
+                                  ("saccade", oc.saccade, saccade_override)):
+        if trace is None:
+            continue
+        if override is not None:
+            out[name] = float(override)
+        else:
+            _, _, values = window_ptp(trace, oc.fs, window_s, step_s)
+            out[name] = robust_threshold(values, k)
+    if oc.blink is not None:
+        velocity = np.abs(np.diff(oc.blink, prepend=oc.blink[0])) * oc.fs
+        out["blink_velocity"] = robust_threshold(velocity, k)
+    return out
+
+
+def ocular_bad_mask(oc, thresholds, n_samples, window_s=0.5, step_s=0.1,
+                    detector="both", min_blink_s=0.05, max_blink_s=0.6,
+                    merge_gap_s=0.15, subject_label="", quiet=False):
+    """
+    Boolean bad-sample mask built from the derived ocular channels.
+
+    The ptp and velocity criteria are OR-ed: velocity adds blink
+    specificity, ptp keeps coverage of the non-blink junk (jaw clench, cable
+    tug) that a blink detector would ignore by design. Returns (mask, stats).
+    """
+    bad = np.zeros(n_samples, dtype=bool)
+    stats = {}
+    use_ptp = detector in ("ptp", "both")
+    use_velocity = detector in ("velocity", "both")
+
+    if use_ptp:
+        for name, trace in (("blink", oc.blink), ("saccade", oc.saccade)):
+            thr = thresholds.get(name)
+            if trace is None or thr is None:
+                continue
+            m = ptp_event_mask(trace[:n_samples], oc.fs, thr, window_s, step_s)
+            bad |= m[:n_samples]
+            stats[f"{name}_ptp_pct"] = 100.0 * m.mean()
+            if not quiet:
+                print(f"     {subject_label}: {name} p2p > {thr:6.1f} uV "
+                      f"-> {100 * m.mean():5.1f}% of samples")
+
+    if use_velocity and oc.blink is not None and thresholds.get("blink_velocity"):
+        thr = thresholds["blink_velocity"]
+        m, kept, cand = velocity_event_mask(
+            oc.blink[:n_samples], oc.fs, thr, min_blink_s, max_blink_s,
+            merge_gap_s)
+        bad |= m[:n_samples]
+        stats["blink_velocity_pct"] = 100.0 * m.mean()
+        stats["blink_events"] = kept
+        if not quiet:
+            print(f"     {subject_label}: blink velocity > {thr:7.0f} uV/s "
+                  f"-> {kept} blinks kept of {cand} candidates "
+                  f"({100 * m.mean():5.1f}% of samples)")
+
+    stats["total_pct"] = 100.0 * bad.mean()
+    return bad, stats
+
+
+def continuous_bad_mask(raw, window_s=0.5, step_s=0.1, threshold_uv=500.0,
+                        pad_s=0.3, extra_bad=None, use_eeg_amplitude=True):
     """
     Slide a window across a subject's continuous signal; mark every sample
     covered by a window as bad if any channel's peak-to-peak amplitude in
     that window exceeds threshold_uv. Also folds in existing BAD_gap
     annotations (lost BLE packets), so both artifact types end up in one
     boolean mask over samples.
+
+    use_eeg_amplitude=False skips the EEG peak-to-peak criterion entirely
+    (--artifact-source ocular), leaving only extra_bad plus the gap
+    annotations. extra_bad is an optional precomputed mask -- in practice
+    the ocular-channel detections from ocular_bad_mask() (point 10) -- which
+    is OR-ed in before padding, so ocular events get the same filter-ringing
+    pad as everything else.
 
     Each resulting bad run is then padded by pad_s on both sides. This
     matters because the band-pass filter applied to the continuous signal
@@ -539,16 +1638,22 @@ def continuous_bad_mask(raw, window_s=0.5, step_s=0.1, threshold_uv=500.0, pad_s
     step_n = max(1, int(round(step_s * sfreq)))
 
     bad = np.zeros(n_samples, dtype=bool)
-    starts = list(range(0, max(1, n_samples - window_n + 1), step_n))
-    last_start = max(0, n_samples - window_n)
-    if not starts or starts[-1] != last_start:
-        starts.append(last_start)
-    for start in starts:
-        end = min(start + window_n, n_samples)
-        seg = data_uv[:, start:end]
-        ptp = seg.max(axis=1) - seg.min(axis=1)
-        if np.any(ptp > threshold_uv):
-            bad[start:end] = True
+    if use_eeg_amplitude:
+        starts = list(range(0, max(1, n_samples - window_n + 1), step_n))
+        last_start = max(0, n_samples - window_n)
+        if not starts or starts[-1] != last_start:
+            starts.append(last_start)
+        for start in starts:
+            end = min(start + window_n, n_samples)
+            seg = data_uv[:, start:end]
+            ptp = seg.max(axis=1) - seg.min(axis=1)
+            if np.any(ptp > threshold_uv):
+                bad[start:end] = True
+
+    # ocular-channel detections (point 10), computed by the caller
+    if extra_bad is not None:
+        bad[:min(n_samples, len(extra_bad))] |= \
+            np.asarray(extra_bad, dtype=bool)[:n_samples]
 
     for ann in raw.annotations:
         if "BAD" in ann["description"]:
@@ -567,7 +1672,8 @@ def continuous_bad_mask(raw, window_s=0.5, step_s=0.1, threshold_uv=500.0, pad_s
 def load_and_preprocess_continuous(csv_path, subject_label, h_freq=40.0,
                                     use_ica=False, align_onset=True, quiet=False,
                                     artifact_window=0.5, artifact_step=0.1,
-                                    artifact_threshold=500.0, artifact_pad=0.3):
+                                    artifact_threshold=500.0, artifact_pad=0.3,
+                                    reference="average"):
     """
     Full load -> preprocess chain for ONE subject's CSV, for the default
     continuous (non-epoched) connectivity path.
@@ -585,7 +1691,8 @@ def load_and_preprocess_continuous(csv_path, subject_label, h_freq=40.0,
 
     nyq = fs / 2
     h_freq_eff = min(h_freq, nyq * 0.95)
-    raw_pp = preprocess(raw, h_freq=h_freq_eff, use_ica=use_ica, subject_label=subject_label)
+    raw_pp = preprocess(raw, h_freq=h_freq_eff, use_ica=use_ica,
+                        subject_label=subject_label, reference=reference)
     bad_mask = continuous_bad_mask(raw_pp, window_s=artifact_window,
                                     step_s=artifact_step,
                                     threshold_uv=artifact_threshold,
@@ -737,8 +1844,11 @@ def _hyyp_connectivity_matrix(epochs_a, epochs_b, band, mode, sfreq,
         epochs_average=True,
     )
     # HyPyP returns (n_freq, 2*n_channels, 2*n_channels) when epochs_average=True.
+    # Derive the block size from the data rather than from CH_NAMES, so the
+    # slice follows --analysis-channels (point 11) instead of always assuming
+    # the full 4-electrode montage.
     con = np.asarray(con)[0]
-    n_chan = len(CH_NAMES)
+    n_chan = data.shape[2]
     return con[:n_chan, n_chan:2 * n_chan]
 
 
@@ -1104,7 +2214,7 @@ def fdr_bh(pvals, alpha=0.05):
 
     Takes a flat array of p-values, returns (reject_mask, corrected_pvals)
     both the same shape as the input. Used instead of raw per-pair p<0.05
-    counting: with 16 channel-pair tests per band at uncorrected p<0.05,
+    counting: with up to 16 channel-pair tests per band at uncorrected p<0.05,
     ~0.8 false positives are expected per band by chance alone, so raw
     counts of "1/16" or "2/16" significant pairs are not meaningfully
     different from noise. FDR correction controls the expected proportion
@@ -1136,6 +2246,83 @@ def fdr_bh(pvals, alpha=0.05):
     reject_full = np.empty(n, dtype=bool)
     reject_full[order] = reject_flat
     return reject_full.reshape(shape), corrected_full.reshape(shape)
+
+
+def summarize_positive_control(observed, null, pvalues, sig_mask=None, alpha=0.05):
+    """
+    Turn a stimulus-band pseudo-pair comparison into a plain-language verdict.
+
+    A positive control is considered a pass when the observed stimulus-band
+    effect exceeds the pool baseline and at least one pair is significant
+    after the chosen multiple-comparisons correction.
+    """
+    observed = np.asarray(observed, dtype=float)
+    null = np.asarray(null, dtype=float)
+    pvalues = np.asarray(pvalues, dtype=float)
+    if sig_mask is None:
+        sig_mask = pvalues < alpha
+    n_sig = int(np.count_nonzero(sig_mask))
+    obs_mean = float(observed.mean())
+    null_mean = float(null.mean())
+    above_null = obs_mean > null_mean
+    passed = above_null and n_sig >= 1
+
+    if passed:
+        status = "PASS"
+        reason = (
+            f"stimulus-band PLV {obs_mean:.3f} exceeded the pool baseline "
+            f"{null_mean:.3f} and {n_sig} pair(s) were significant"
+        )
+    elif above_null:
+        status = "WEAK"
+        reason = (
+            f"stimulus-band PLV {obs_mean:.3f} exceeded the pool baseline "
+            f"{null_mean:.3f}, but no pairs reached the significance threshold"
+        )
+    else:
+        status = "FAIL"
+        reason = (
+            f"stimulus-band PLV {obs_mean:.3f} did not exceed the pool baseline "
+            f"{null_mean:.3f}"
+        )
+    return {
+        "status": status,
+        "passed": passed,
+        "observed_mean": obs_mean,
+        "null_mean": null_mean,
+        "n_sig_pairs": n_sig,
+        "reason": reason,
+    }
+
+
+def resolve_pool_csvs(pool_dir, csv_a, csv_b):
+    """
+    Resolve a pool of CSV recordings for pseudo-pair validation.
+
+    Prefer the explicitly supplied pool directory. If that directory is empty
+    or missing, fall back to the parent directory of the two real recordings,
+    which is often the most practical place for a pilot dataset.
+    """
+    candidates = []
+    if pool_dir:
+        candidates.append(pool_dir)
+    for path in (csv_a, csv_b):
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent not in candidates:
+            candidates.append(parent)
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        abs_candidate = os.path.abspath(candidate)
+        if not os.path.isdir(abs_candidate):
+            continue
+        files = sorted(glob.glob(os.path.join(abs_candidate, "*.csv")))
+        if files:
+            return files
+    return []
 
 
 # ============================================================
@@ -1174,13 +2361,82 @@ def plot_psd(raw_a, raw_b, out_path):
     plt.close(fig)
 
 
+def plot_ocular_channels(oc_a, oc_b, out_path):
+    """
+    QC figure for the derived ocular channels (point 9), one row per subject.
+
+    What to look for: blinks should appear on the BLINK trace as large,
+    same-shape deflections a few hundred ms wide, and should be much smaller
+    on the SACCADE trace; horizontal eye movements should do the opposite.
+    If both traces look identical, the frontal electrodes are probably not
+    picking up lateral differences and the saccade channel is not
+    trustworthy for this subject.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 6.5),
+                             gridspec_kw={"width_ratios": [3, 2]})
+    colors = {"blink": "#0072B2", "saccade": "#D55E00"}
+    zoom_s = 8.0
+    for (ax_full, ax_zoom), oc in zip(axes, (oc_a, oc_b)):
+        traces = [(n, t) for n, t in (("blink", oc.blink),
+                                      ("saccade", oc.saccade)) if t is not None]
+        if not traces:
+            ax_full.text(0.5, 0.5, f"Subject {oc.label}: no ocular channels "
+                                   "available (electrodes flagged bad)",
+                         ha="center", va="center", transform=ax_full.transAxes,
+                         fontsize=11, color="#888")
+            for ax in (ax_full, ax_zoom):
+                ax.set_yticks([])
+                ax.set_xticks([])
+            continue
+        # stack the traces with a shared, robust offset so a single huge
+        # artifact cannot squash the other trace flat
+        scale = max(np.percentile(np.abs(t), 99) for _, t in traces) or 1.0
+        step = 4.0 * scale
+        time = np.arange(len(traces[0][1])) / oc.fs
+
+        # Zoom on the single largest excursion of the primary trace. At full
+        # length a 300ms blink is about one pixel wide, so the overview
+        # cannot show morphology -- and morphology is the whole point of
+        # eyeballing these channels.
+        primary = dict(traces).get("blink", traces[0][1])
+        half_n = int(0.5 * zoom_s * oc.fs)
+        peak = int(np.argmax(np.abs(primary)))
+        z0 = max(0, min(peak - half_n, len(primary) - 2 * half_n))
+        z1 = min(len(primary), z0 + 2 * half_n)
+
+        for ax, (lo, hi) in ((ax_full, (0, len(time))), (ax_zoom, (z0, z1))):
+            for i, (name, trace) in enumerate(traces):
+                ax.plot(time[lo:hi], trace[lo:hi] + i * step, lw=0.6,
+                        color=colors[name])
+            ax.set_yticks([i * step for i in range(len(traces))])
+            ax.set_yticklabels([n for n, _ in traces])
+            ax.margins(x=0)
+        ax_full.axvspan(time[z0], time[max(z0, z1 - 1)], color="#000",
+                        alpha=0.08, lw=0)
+        ax_full.set_ylabel(f"Subject {oc.label}")
+        ax_full.set_title(
+            f"Subject {oc.label}  ({oc.l_freq:g}-{oc.h_freq:g} Hz)   "
+            + "   ".join(f"{n}: std={t.std():.0f} uV" for n, t in traces),
+            fontsize=9, loc="left")
+        ax_zoom.set_title(f"zoom: {zoom_s:g}s around the largest excursion "
+                          f"(t={time[peak]:.1f}s)", fontsize=9, loc="left")
+    for ax in axes[-1]:
+        ax.set_xlabel("Time (s)")
+    fig.suptitle("Derived ocular channels   "
+                 "saccade = AF7 - AF8,   blink = mean(AF7, AF8) - mean(TP9, TP10)",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+
+
 def plot_plv_matrix(plv, band_name, out_path, surrogate_p=None, sig_mask=None):
     fig, ax = plt.subplots(figsize=(5, 4.5))
     im = ax.imshow(plv, cmap="viridis", vmin=0, vmax=1)
-    ax.set_xticks(range(len(CH_NAMES)))
-    ax.set_yticks(range(len(CH_NAMES)))
-    ax.set_xticklabels([f"B:{c}" for c in CH_NAMES])
-    ax.set_yticklabels([f"A:{c}" for c in CH_NAMES])
+    ax.set_xticks(range(len(ANALYSIS_CH)))
+    ax.set_yticks(range(len(ANALYSIS_CH)))
+    ax.set_xticklabels([f"B:{c}" for c in ANALYSIS_CH])
+    ax.set_yticklabels([f"A:{c}" for c in ANALYSIS_CH])
     ax.set_title(f"Inter-brain PLV -- {band_name}")
     plt.colorbar(im, ax=ax, label="PLV")
     for i in range(plv.shape[0]):
@@ -1201,10 +2457,10 @@ def plot_plv_matrix(plv, band_name, out_path, surrogate_p=None, sig_mask=None):
 def plot_circ_corr_matrix(cc, band_name, out_path, surrogate_p=None, sig_mask=None):
     fig, ax = plt.subplots(figsize=(5, 4.5))
     im = ax.imshow(cc, cmap="RdBu_r", vmin=-1, vmax=1)
-    ax.set_xticks(range(len(CH_NAMES)))
-    ax.set_yticks(range(len(CH_NAMES)))
-    ax.set_xticklabels([f"B:{c}" for c in CH_NAMES])
-    ax.set_yticklabels([f"A:{c}" for c in CH_NAMES])
+    ax.set_xticks(range(len(ANALYSIS_CH)))
+    ax.set_yticks(range(len(ANALYSIS_CH)))
+    ax.set_xticklabels([f"B:{c}" for c in ANALYSIS_CH])
+    ax.set_yticklabels([f"A:{c}" for c in ANALYSIS_CH])
     ax.set_title(f"Inter-brain Circular Corr -- {band_name}")
     plt.colorbar(im, ax=ax, label="r (circ)")
     for i in range(cc.shape[0]):
@@ -1228,10 +2484,10 @@ def plot_circ_corr_comparison(ccs_by_band, out_path):
         axes = [axes]
     for ax, (band, cc) in zip(axes, ccs_by_band.items()):
         im = ax.imshow(cc, cmap="RdBu_r", vmin=-1, vmax=1)
-        ax.set_xticks(range(len(CH_NAMES)))
-        ax.set_yticks(range(len(CH_NAMES)))
-        ax.set_xticklabels([f"B:{c}" for c in CH_NAMES], rotation=45, ha="right")
-        ax.set_yticklabels([f"A:{c}" for c in CH_NAMES])
+        ax.set_xticks(range(len(ANALYSIS_CH)))
+        ax.set_yticks(range(len(ANALYSIS_CH)))
+        ax.set_xticklabels([f"B:{c}" for c in ANALYSIS_CH], rotation=45, ha="right")
+        ax.set_yticklabels([f"A:{c}" for c in ANALYSIS_CH])
         ax.set_title(f"{band}  (mean={cc.mean():.2f})")
     fig.suptitle("Inter-brain Circular Correlation across frequency bands")
     plt.colorbar(im, ax=axes, shrink=0.8, label="r (circ)")
@@ -1245,10 +2501,10 @@ def plot_plv_comparison(plvs_by_band, out_path):
         axes = [axes]
     for ax, (band, plv) in zip(axes, plvs_by_band.items()):
         im = ax.imshow(plv, cmap="viridis", vmin=0, vmax=1)
-        ax.set_xticks(range(len(CH_NAMES)))
-        ax.set_yticks(range(len(CH_NAMES)))
-        ax.set_xticklabels([f"B:{c}" for c in CH_NAMES], rotation=45, ha="right")
-        ax.set_yticklabels([f"A:{c}" for c in CH_NAMES])
+        ax.set_xticks(range(len(ANALYSIS_CH)))
+        ax.set_yticks(range(len(ANALYSIS_CH)))
+        ax.set_xticklabels([f"B:{c}" for c in ANALYSIS_CH], rotation=45, ha="right")
+        ax.set_yticklabels([f"A:{c}" for c in ANALYSIS_CH])
         ax.set_title(f"{band}  (mean={plv.mean():.2f})")
     fig.suptitle("Inter-brain PLV across frequency bands")
     plt.colorbar(im, ax=axes, shrink=0.8, label="PLV")
@@ -1429,6 +2685,115 @@ def main():
                    help="remove the single most blink-correlated ICA component per "
                         "subject before referencing (experimental -- only 4 channels "
                         "available, so separation is weak)")
+    p.add_argument("--ocular-correction",
+                   choices=["none", "regress", "emcp"], default="none",
+                   help="ocular artifact handling (default none). 'regress' "
+                        "applies the continuous Gratton regression: subtract "
+                        "beta * ocular(t) per channel and KEEP the samples, "
+                        "instead of masking them. Masking cannot give long "
+                        "windows in a dyad (see analyze_blink_ceiling.py); "
+                        "this is the route that can. 'emcp' is the faithful "
+                        "Gratton/Coles/Donchin procedure: its own template "
+                        "blink detector, SEPARATE propagation factors for "
+                        "blink and non-blink samples, applied piecewise. "
+                        "'regress' is the one-coefficient simplification. "
+                        "See point 12.")
+    p.add_argument("--emcp-channels", choices=["blink", "both"],
+                   default="blink",
+                   help="(--ocular-correction emcp) which derived EOG "
+                        "channels enter the regression. 'blink' = vertical "
+                        "only, which the original supports and which is the "
+                        "safer choice here; 'both' adds the horizontal "
+                        "channel as the original usually does, but on four "
+                        "electrodes the two regressors together remove most "
+                        "of the frontal variance (point 12).")
+    p.add_argument("--regress-fit", choices=["blinks", "all"],
+                   default="blinks",
+                   help="where the regression coefficient is estimated "
+                        "(default blinks). Blinks are ~2.5%% of a recording, "
+                        "so fitting over the whole recording measures the "
+                        "structural covariance between the regressor and the "
+                        "channels it is built from, and subtracting that "
+                        "strips real signal everywhere. Fitting on detected "
+                        "blink periods only keeps the fit "
+                        "artifact-dominated. 'all' restores the naive fit "
+                        "for comparison.")
+    p.add_argument("--regress-channels", choices=["blink", "saccade", "both"],
+                   default="blink",
+                   help="which ocular channels to regress out (default "
+                        "blink). 'both' is refused when the analysis set is "
+                        "frontal-only under a mastoid reference, where the "
+                        "two regressors span the whole channel space and "
+                        "would annihilate the data -- see point 12.")
+    p.add_argument("--analysis-channels", choices=["auto", "all", "frontal"],
+                   default="auto",
+                   help="which channels the connectivity metrics run on "
+                        "(default auto). 'auto' = all four under --reference "
+                        "average, AF7/AF8 under --reference mastoid, because "
+                        "a linked-mastoid reference makes TP9/TP10 exact "
+                        "mirror images whose cross-brain metrics are "
+                        "redundant. 'all'/'frontal' force it. Referencing, "
+                        "artifact detection and the ocular channels always "
+                        "use the full montage. See point 11.")
+    p.add_argument("--artifact-source", choices=["eeg", "ocular", "both"],
+                   default="eeg",
+                   help="what artifact detection keys off (default eeg = the "
+                        "original behaviour, so results stay comparable). "
+                        "'ocular' detects on the derived blink/saccade "
+                        "channels with per-participant thresholds instead of "
+                        "a fixed EEG amplitude; 'both' ORs the two. See "
+                        "point 10 of the module docstring.")
+    p.add_argument("--ocular-k", type=float, default=5.0,
+                   help="threshold = median + k*MAD of that participant's own "
+                        "windowed peak-to-peak distribution (default 5). "
+                        "Lower = stricter. MAD not sd, so the artifacts "
+                        "cannot inflate the threshold meant to catch them.")
+    p.add_argument("--ocular-detector", choices=["ptp", "velocity", "both"],
+                   default="both",
+                   help="ocular detector (default both). 'ptp' = "
+                        "sliding-window peak-to-peak, catches anything large; "
+                        "'velocity' = |d/dt| plus a duration test, which is "
+                        "specifically a blink detector; 'both' ORs them.")
+    p.add_argument("--blink-min-dur", type=float, default=0.05,
+                   help="shortest accepted blink for the velocity detector, "
+                        "seconds (default 0.05)")
+    p.add_argument("--blink-max-dur", type=float, default=0.6,
+                   help="longest accepted blink for the velocity detector, "
+                        "seconds (default 0.6). Longer events are sustained "
+                        "muscle/movement, not blinks, and are left to the "
+                        "peak-to-peak criterion.")
+    p.add_argument("--blink-threshold-a", type=float, default=None,
+                   help="override subject A's automatic blink-channel "
+                        "threshold (uV)")
+    p.add_argument("--blink-threshold-b", type=float, default=None,
+                   help="override subject B's automatic blink-channel "
+                        "threshold (uV)")
+    p.add_argument("--saccade-threshold-a", type=float, default=None,
+                   help="override subject A's automatic saccade-channel "
+                        "threshold (uV)")
+    p.add_argument("--saccade-threshold-b", type=float, default=None,
+                   help="override subject B's automatic saccade-channel "
+                        "threshold (uV)")
+    p.add_argument("--ocular-band", type=float, nargs=2,
+                   default=[OCULAR_L_FREQ, OCULAR_H_FREQ],
+                   metavar=("LOW", "HIGH"),
+                   help="pass band (Hz) for the derived ocular channels "
+                        f"(default {OCULAR_L_FREQ} {OCULAR_H_FREQ}). Kept "
+                        "separate from the 1-40 Hz analysis band on purpose: "
+                        "blink energy is mostly below 3 Hz, so the analysis "
+                        "high-pass would remove most of what a blink detector "
+                        "needs. Raised automatically if the recording is too "
+                        "short to support the requested high-pass.")
+    p.add_argument("--reference", choices=["average", "mastoid"], default="average",
+                   help="re-reference scheme (default average). 'mastoid' uses a "
+                        "linked-mastoid reference, i.e. every channel minus "
+                        "mean(TP9, TP10). Both cancel the Muse's FPZ online "
+                        "reference (which sits over the eyes and injects ocular "
+                        "activity into all 4 channels as common mode); the mastoid "
+                        "option additionally avoids mixing all 4 electrodes into "
+                        "each other, at the cost of spending TP9/TP10 -- under it, "
+                        "only AF7/AF8 carry independent information. See point 8 "
+                        "of the module docstring.")
     p.add_argument("--prefilter", dest="prefilter", action="store_true", default=True,
                    help="(--legacy-epochs only; the continuous/default path "
                         "always band-passes the continuous signal before the "
@@ -1543,9 +2908,60 @@ def main():
     nyq = fs_a / 2
     h_freq = min(40.0, nyq * 0.95)
     ica_str = " + ICA blink removal" if args.ica else ""
-    print(f"  bandpass 1-{h_freq:.0f} Hz{ica_str}, average reference")
-    raw_a_pp = preprocess(raw_a, h_freq=h_freq, use_ica=args.ica, subject_label="A")
-    raw_b_pp = preprocess(raw_b, h_freq=h_freq, use_ica=args.ica, subject_label="B")
+    ref_str = ("linked-mastoid reference (TP9/TP10)" if args.reference == "mastoid"
+               else "average reference")
+    print(f"  bandpass 1-{h_freq:.0f} Hz{ica_str}, {ref_str}")
+    raw_a_pp = preprocess(raw_a, h_freq=h_freq, use_ica=args.ica,
+                          subject_label="A", reference=args.reference)
+    raw_b_pp = preprocess(raw_b, h_freq=h_freq, use_ica=args.ica,
+                          subject_label="B", reference=args.reference)
+
+    # Derived ocular channels (point 9), built from the UNFILTERED raw so
+    # they can use a lower high-pass than the analysis band. Inspection only
+    # at this stage -- nothing downstream keys off them yet.
+    print(f"  derived ocular channels "
+          f"({args.ocular_band[0]:g}-{args.ocular_band[1]:g} Hz):")
+    oc_a = make_ocular_channels(raw_a, l_freq=args.ocular_band[0],
+                                h_freq=args.ocular_band[1],
+                                subject_label="A", bads=raw_a_pp.info["bads"])
+    oc_b = make_ocular_channels(raw_b, l_freq=args.ocular_band[0],
+                                h_freq=args.ocular_band[1],
+                                subject_label="B", bads=raw_b_pp.info["bads"])
+
+    # Ocular correction by regression (point 12). Applied AFTER the ocular
+    # channels are built (they are the regressors) and BEFORE artifact
+    # detection, so detection sees the corrected signal and only has to catch
+    # what the regression could not remove. oc_a/oc_b are deliberately left
+    # uncorrected -- they are the record of where the blinks were, and the
+    # ocular_channels.png figure should show the regressor, not the residual.
+    regress_info = {"A": None, "B": None}
+    if args.ocular_correction == "emcp":
+        print("  ocular correction: Gratton EMCP (template blink detector, "
+              "separate blink/saccade propagation factors)")
+        raw_a_pp, regress_info["A"] = gratton_emcp(
+            raw_a_pp, oc_a, l_freq=1.0, h_freq=h_freq, subject_label="A",
+            channels=args.emcp_channels)
+        raw_b_pp, regress_info["B"] = gratton_emcp(
+            raw_b_pp, oc_b, l_freq=1.0, h_freq=h_freq, subject_label="B",
+            channels=args.emcp_channels)
+        if not (regress_info["A"]["applied"] and regress_info["B"]["applied"]):
+            print("  WARNING: EMCP was not applied for at least one subject "
+                  "(see above); that subject's data below is uncorrected")
+    elif args.ocular_correction == "regress":
+        regressors = (("blink", "saccade") if args.regress_channels == "both"
+                      else (args.regress_channels,))
+        print(f"  ocular correction: Gratton regression, regressors="
+              f"{list(regressors)}")
+        raw_a_pp, regress_info["A"] = gratton_regress(
+            raw_a_pp, oc_a, regressors=regressors, l_freq=1.0, h_freq=h_freq,
+            subject_label="A", fit_on=args.regress_fit, k=args.ocular_k)
+        raw_b_pp, regress_info["B"] = gratton_regress(
+            raw_b_pp, oc_b, regressors=regressors, l_freq=1.0, h_freq=h_freq,
+            subject_label="B", fit_on=args.regress_fit, k=args.ocular_k)
+        if not (regress_info["A"]["applied"] and regress_info["B"]["applied"]):
+            print("  WARNING: regression was not applied for at least one "
+                  "subject (see above); results below are uncorrected for "
+                  "that subject")
 
     if args.sync_signal_hz is not None and not args.legacy_epochs:
         offset_s, drift_rate = estimate_sync_offset_drift(
@@ -1560,6 +2976,21 @@ def main():
 
     plot_raw_with_gaps(raw_a_pp, raw_b_pp, os.path.join(out_dir, "raw_with_gaps.png"))
     plot_psd(raw_a_pp, raw_b_pp, os.path.join(out_dir, "psd.png"))
+    plot_ocular_channels(oc_a, oc_b, os.path.join(out_dir, "ocular_channels.png"))
+
+    # Which channels the METRICS run on (point 11). Everything above this
+    # line -- referencing, bad-channel detection, ocular channels -- and the
+    # artifact detection below it still use the full four-electrode montage;
+    # only the connectivity step is restricted.
+    analysis_ch = resolve_analysis_channels(args.analysis_channels,
+                                            args.reference)
+    set_analysis_channels(analysis_ch)
+    n_pairs = len(analysis_ch) ** 2
+    print(f"  analysis channels: {analysis_ch} "
+          f"({n_pairs} cross-brain pairs per band"
+          + (", auto-selected for the mastoid reference"
+             if args.analysis_channels == "auto" and args.reference == "mastoid"
+             else "") + ")")
 
     epochs_a = epochs_b = None
     n_ep = None
@@ -1575,9 +3006,14 @@ def main():
         thresh_str = f"{amp_thresh} uV" if amp_thresh else "disabled"
         print(f"  epoch_len={args.epoch_len}s  overlap={args.epoch_overlap}s  "
               f"amplitude_threshold={thresh_str}")
-        epochs_a = epoch_with_gap_rejection(raw_a_pp, args.epoch_len, args.epoch_overlap,
+        # epoch rejection keys off amplitude, so restrict AFTER it would be
+        # wrong for the dropped channels but right for the kept ones; restrict
+        # first so the epochs that survive are the ones the metrics will use
+        raw_a_ana = restrict_to_analysis(raw_a_pp, analysis_ch, "A")
+        raw_b_ana = restrict_to_analysis(raw_b_pp, analysis_ch, "B")
+        epochs_a = epoch_with_gap_rejection(raw_a_ana, args.epoch_len, args.epoch_overlap,
                                             amplitude_uv=amp_thresh or 1e9)
-        epochs_b = epoch_with_gap_rejection(raw_b_pp, args.epoch_len, args.epoch_overlap,
+        epochs_b = epoch_with_gap_rejection(raw_b_ana, args.epoch_len, args.epoch_overlap,
                                             amplitude_uv=amp_thresh or 1e9)
         print(f"  Subject A: {len(epochs_a)} epochs survived (out of "
               f"{len(epochs_a.drop_log)} attempted)")
@@ -1612,31 +3048,86 @@ def main():
         print("="*60)
         print(f"  sliding window={args.artifact_window}s  step={args.artifact_step}s  "
               f"threshold={args.artifact_threshold} uV  pad={args.artifact_pad}s")
+        print(f"  source={args.artifact_source}"
+              + (f"  detector={args.ocular_detector}  k={args.ocular_k:g}"
+                 if args.artifact_source != "eeg" else ""))
         print(f"  circular correlation method: {args.circ_corr_method}")
+
+        use_eeg = args.artifact_source in ("eeg", "both")
+        use_ocular = args.artifact_source in ("ocular", "both")
+        ocular_thr = {"A": None, "B": None}
+        extra = {"A": None, "B": None}
+        if use_ocular:
+            for lbl, oc, raw_pp, b_ovr, s_ovr in (
+                    ("A", oc_a, raw_a_pp, args.blink_threshold_a,
+                     args.saccade_threshold_a),
+                    ("B", oc_b, raw_b_pp, args.blink_threshold_b,
+                     args.saccade_threshold_b)):
+                thr = ocular_thresholds(oc, window_s=args.artifact_window,
+                                        step_s=args.artifact_step,
+                                        k=args.ocular_k,
+                                        blink_override=b_ovr,
+                                        saccade_override=s_ovr)
+                ocular_thr[lbl] = thr
+                extra[lbl], _ = ocular_bad_mask(
+                    oc, thr, raw_pp.n_times,
+                    window_s=args.artifact_window, step_s=args.artifact_step,
+                    detector=args.ocular_detector,
+                    min_blink_s=args.blink_min_dur,
+                    max_blink_s=args.blink_max_dur, subject_label=lbl)
+                # --artifact-source ocular REPLACES the EEG amplitude
+                # criterion. If this subject has no usable ocular channel
+                # (every frontal or every mastoid electrode flagged bad),
+                # that leaves no amplitude rejection at all, and the run
+                # will cheerfully report ~100% "clean" on data that is
+                # entirely railed. Say so rather than let the number stand.
+                if not use_eeg and oc.blink is None and oc.saccade is None:
+                    print(f"     {lbl}: WARNING no ocular channels AND "
+                          "--artifact-source ocular -- NO amplitude "
+                          "rejection is being applied to this subject. "
+                          "Any 'clean' fraction below is meaningless; use "
+                          "--artifact-source both.")
+
         bad_a = continuous_bad_mask(raw_a_pp, window_s=args.artifact_window,
                                      step_s=args.artifact_step,
                                      threshold_uv=args.artifact_threshold,
-                                     pad_s=args.artifact_pad)
+                                     pad_s=args.artifact_pad,
+                                     extra_bad=extra["A"],
+                                     use_eeg_amplitude=use_eeg)
         bad_b = continuous_bad_mask(raw_b_pp, window_s=args.artifact_window,
                                      step_s=args.artifact_step,
                                      threshold_uv=args.artifact_threshold,
-                                     pad_s=args.artifact_pad)
+                                     pad_s=args.artifact_pad,
+                                     extra_bad=extra["B"],
+                                     use_eeg_amplitude=use_eeg)
         n_common = min(len(bad_a), len(bad_b))
         bad_a = bad_a[:n_common]
         bad_b = bad_b[:n_common]
         good_mask = ~(bad_a | bad_b)
         total_s = n_common / fs_a
         good_s = good_mask.sum() / fs_a
-        print(f"  Subject A: {100 * (~bad_a).mean():.1f}% clean")
-        print(f"  Subject B: {100 * (~bad_b).mean():.1f}% clean")
+        longest_s = longest_clean_run_s(good_mask, fs_a)
+        print(f"  Subject A: {100 * (~bad_a).mean():.1f}% clean "
+              f"(longest run {longest_clean_run_s(~bad_a, fs_a):.1f}s)")
+        print(f"  Subject B: {100 * (~bad_b).mean():.1f}% clean "
+              f"(longest run {longest_clean_run_s(~bad_b, fs_a):.1f}s)")
         print(f"  Jointly clean (usable for connectivity): {good_s:.1f}s / "
               f"{total_s:.1f}s ({100 * good_mask.mean():.1f}%)")
+        # The metric that decides whether a preprocessing change actually
+        # helped: clean fraction can stay flat while the data goes from one
+        # long stretch to many short crumbs, and short windows inflate PLV
+        # (point 5). Compare this number across --reference settings.
+        print(f"  Longest continuous jointly-clean run: {longest_s:.1f}s")
 
         if good_mask.sum() == 0:
             print()
             print("  No jointly-clean samples survive. Try loosening "
                   "--artifact-threshold, or check hardware/fit.")
             sys.exit(0)
+
+        # masks are built; from here on only the analysis channels matter
+        raw_a_pp = restrict_to_analysis(raw_a_pp, analysis_ch, "A")
+        raw_b_pp = restrict_to_analysis(raw_b_pp, analysis_ch, "B")
 
     # ------------------------------------------------------------------
     # Optionally load a pool of OTHER subjects' recordings for pseudo-pair
@@ -1645,22 +3136,27 @@ def main():
     # ------------------------------------------------------------------
     pool_epochs = []
     pool_data = []  # continuous mode: list of (raw_pp, bad_mask)
-    if args.pool_dir:
+    pool_dir_used = args.pool_dir
+    if args.pool_dir or args.stim_hz is not None:
         print()
         print("="*60)
         print("LOADING POOL (for pseudo-pair / cross-dyad validation)")
         print("="*60)
-        pool_files = sorted(
-            glob.glob(os.path.join(args.pool_dir, "*.csv"))
-        )
+        pool_files = resolve_pool_csvs(args.pool_dir, args.csv_a, args.csv_b)
+        pool_source = args.pool_dir or os.path.dirname(os.path.abspath(args.csv_a))
+        if args.pool_dir and not pool_files:
+            print(f"  WARNING: no CSVs found in {args.pool_dir}; falling back to "
+                  f"{pool_source} for pool validation.")
+        elif not args.pool_dir and not pool_files:
+            print(f"  WARNING: no pool CSVs found in {pool_source}; "
+                  "pseudo-pair validation will be skipped.")
         # never pool the two real subjects' own files against themselves
         pool_files = [f for f in pool_files
                       if os.path.abspath(f) not in
                       (os.path.abspath(args.csv_a), os.path.abspath(args.csv_b))]
         if not pool_files:
-            print(f"  WARNING: no CSVs found in {args.pool_dir} (or all "
-                  "excluded as the real subjects) -- pseudo-pair validation "
-                  "will be skipped.")
+            print(f"  WARNING: no usable pool CSVs remained after excluding the "
+                  "real subjects -- pseudo-pair validation will be skipped.")
         pool_amp_thresh_arg = (args.pool_amplitude_threshold
                                if args.pool_amplitude_threshold is not None
                                else args.amplitude_threshold)
@@ -1675,9 +3171,11 @@ def main():
                     epoch_len_s=args.epoch_len, overlap_s=args.epoch_overlap,
                     h_freq=h_freq, amplitude_uv=pool_amp_thresh or 1e9,
                     use_ica=args.ica, align_onset=True, quiet=False,
+                    reference=args.reference,
                 )
                 if ep is not None and fs_pool == fs_a:
-                    pool_epochs.append(ep)
+                    pool_epochs.append(restrict_to_analysis(
+                        ep, analysis_ch, quiet=True))
                 elif ep is not None:
                     print(f"  WARNING: {f} has fs={fs_pool} != {fs_a}, skipping "
                           "(sampling rate must match for pooling)")
@@ -1692,9 +3190,11 @@ def main():
                     artifact_step=args.artifact_step,
                     artifact_threshold=args.artifact_threshold,
                     artifact_pad=args.artifact_pad,
+                    reference=args.reference,
                 )
                 if raw_pool is not None and fs_pool == fs_a:
-                    pool_data.append((raw_pool, bad_pool))
+                    pool_data.append((restrict_to_analysis(
+                        raw_pool, analysis_ch, quiet=True), bad_pool))
                 elif raw_pool is not None:
                     print(f"  WARNING: {f} has fs={fs_pool} != {fs_a}, skipping "
                           "(sampling rate must match for pooling)")
@@ -1738,6 +3238,48 @@ def main():
             f"{good_mask.sum() / fs_a:.1f}s/{n_common / fs_a:.1f}s usable "
             f"({100 * good_mask.mean():.1f}%), circ-corr method={args.circ_corr_method}"
         )
+    summary_lines.append(f"  reference={args.reference}  ica={args.ica}")
+    ocular_bits = []
+    for oc in (oc_a, oc_b):
+        have = [n for n, t in (("blink", oc.blink), ("saccade", oc.saccade))
+                if t is not None]
+        ocular_bits.append(f"{oc.label}:{'+'.join(have) if have else 'none'}")
+    summary_lines.append(
+        f"  ocular channels ({oc_a.l_freq:g}-{oc_a.h_freq:g} Hz): "
+        + "  ".join(ocular_bits))
+    summary_lines.append(
+        f"  artifact_source={args.artifact_source}  "
+        f"analysis_channels={'+'.join(analysis_ch)} "
+        f"({len(analysis_ch) ** 2} pairs/band)")
+    summary_lines.append(f"  ocular_correction={args.ocular_correction}"
+                         + (f" ({args.regress_channels})"
+                            if args.ocular_correction == "regress" else ""))
+    for lbl in ("A", "B"):
+        ri = regress_info.get(lbl)
+        if ri and ri["applied"]:
+            summary_lines.append(
+                f"    {lbl} variance kept: "
+                + "  ".join(f"{ch.split('_')[-1]}={100 * v:.0f}%"
+                            for ch, v in ri["variance_kept"].items()))
+        elif ri:
+            summary_lines.append(f"    {lbl} regression NOT applied")
+    if not args.legacy_epochs and args.artifact_source != "eeg":
+        summary_lines.append(
+            f"  ocular detector={args.ocular_detector}  k={args.ocular_k:g}")
+        for lbl in ("A", "B"):
+            thr = ocular_thr.get(lbl)
+            if not thr:
+                continue
+            bits = "  ".join(
+                f"{n}={thr[n]:.1f}" for n in ("blink", "saccade")
+                if thr.get(n) is not None)
+            vel = (f"  velocity={thr['blink_velocity']:.0f} uV/s"
+                   if thr.get("blink_velocity") else "")
+            summary_lines.append(f"    {lbl} thresholds (uV): {bits}{vel}")
+    if not args.legacy_epochs:
+        summary_lines.append(
+            f"  longest continuous jointly-clean run: "
+            f"{longest_clean_run_s(good_mask, fs_a):.1f}s")
     summary_lines.append(f"  prefilter={args.prefilter}  "
                          f"correction={args.correction}  "
                          f"pool_dir={args.pool_dir or '(none)'}")
@@ -1988,7 +3530,8 @@ def main():
                             f"FDR-corrected): {n_sig_pool}/{plv.size}  "
                             f"[pool null mean={null_plv_pool.mean():.3f}]")
                 else:
-                    n_sig_pool = int((p_val_pool < 0.05).sum())
+                    sig_mask_pool = p_val_pool < 0.05
+                    n_sig_pool = int(sig_mask_pool.sum())
                     line = (f"     PLV significant pairs vs POOL (pseudo-pair{matched_tag}, "
                             f"UNCORRECTED): {n_sig_pool}/{plv.size}  "
                             f"[pool null mean={null_plv_pool.mean():.3f}]")
@@ -2000,6 +3543,24 @@ def main():
                         f"-> {'ABOVE pool baseline' if plv_for_pval.mean() > null_plv_pool.mean() else 'NOT above pool baseline'}")
                 print(line)
                 summary_lines.append(line)
+
+                if args.stim_hz is not None and band_name == stim_band_name:
+                    verdict = summarize_positive_control(
+                        plv_for_pval, null_plv_pool, p_val_pool, sig_mask=sig_mask_pool)
+                    verdict_line = (
+                        f"     positive-control verdict: {verdict['status']} - "
+                        f"{verdict['reason']}"
+                    )
+                    print(verdict_line)
+                    summary_lines.append(verdict_line)
+            else:
+                if args.stim_hz is not None and band_name == stim_band_name:
+                    verdict_line = (
+                        f"     positive-control verdict: NOT EVALUATED - no pool "
+                        "recordings were available for pseudo-pair comparison"
+                    )
+                    print(verdict_line)
+                    summary_lines.append(verdict_line)
 
         plot_plv_matrix(
             plv, band_name,
@@ -2034,6 +3595,7 @@ def main():
     print("  plv_p_pool_<band>.npy         - cross-dyad pseudo-pair p-values (if --pool-dir)")
     print("  raw_with_gaps.png             - signal + gap markers")
     print("  psd.png                       - power spectrum QC")
+    print("  ocular_channels.png           - derived blink/saccade channels")
     print("  summary.txt                   - numerical summary")
 
 

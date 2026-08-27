@@ -34,6 +34,18 @@ Usage:
   python play_stimulus.py clip.mp4
   python play_stimulus.py clip.mp4 --countdown 5
   python play_stimulus.py clip.mp4 --marker trial_1_start --fullscreen
+
+Two-monitor frequency-tagging (subject A at one rate, subject B at another --
+the unambiguous inter-brain test; see pipeline.py --tag-hz-a/--tag-hz-b):
+  Terminal 1: python record_both.py 65 Muse_A Muse_B
+  Terminal 2: python play_stimulus.py stimuli/checker_6hz.mp4   --monitor 1 --fullscreen --marker tagA_6hz
+  Terminal 3: python play_stimulus.py stimuli/checker_7.5hz.mp4 --monitor 2 --fullscreen --marker tagB_7.5hz
+  (--monitor needs `pip install screeninfo`; otherwise use --pos X,Y with the
+   second monitor's origin from your OS display settings, e.g. --pos 1920,0)
+
+  Dry-run the placement first (no recording/clip needed):
+    python play_stimulus.py --test-monitors                          # list monitors
+    python play_stimulus.py --test-monitors --monitor 2 --fullscreen # test-card on screen 2
 """
 
 import argparse
@@ -79,7 +91,99 @@ def text_frame(shape, lines, font_scale=None):
     return frame
 
 
-def play(video_path, marker_name, countdown_s, fullscreen):
+def resolve_monitor_origin(monitor, pos):
+    """
+    Work out the (x, y) top-left pixel where the stimulus window should be
+    placed, for multi-monitor frequency-tagging (subject A's clip on one
+    screen, subject B's on another).
+
+    --pos "X,Y" is an explicit override (read the second monitor's origin from
+    your OS display settings, e.g. "1920,0"). Otherwise --monitor N looks the
+    geometry up via the optional `screeninfo` package (1-indexed, ordered as
+    the OS reports them). Returns (x, y) or None to leave the window where the
+    OS put it (primary screen).
+    """
+    if pos:
+        try:
+            x, y = (int(v) for v in pos.replace(" ", "").split(","))
+            return x, y
+        except ValueError:
+            print(f"  WARNING: could not parse --pos '{pos}' (want 'X,Y') -- ignoring.")
+            return None
+    if monitor:
+        try:
+            from screeninfo import get_monitors
+        except ImportError:
+            print("  WARNING: --monitor needs the 'screeninfo' package "
+                  "(pip install screeninfo). Use --pos X,Y instead for now -- ignoring.")
+            return None
+        mons = get_monitors()
+        if not (1 <= monitor <= len(mons)):
+            print(f"  WARNING: --monitor {monitor} out of range (found {len(mons)} "
+                  f"monitor(s)) -- ignoring.")
+            return None
+        m = mons[monitor - 1]
+        print(f"  target monitor {monitor}: {m.width}x{m.height} at ({m.x},{m.y})")
+        return m.x, m.y
+    return None
+
+
+def list_monitors():
+    """Print the monitors screeninfo can see, with the --monitor index to use
+    for each. Returns the list, or None if screeninfo isn't installed."""
+    try:
+        from screeninfo import get_monitors
+    except ImportError:
+        print("  screeninfo not installed (pip install screeninfo) -- can't "
+              "enumerate monitors. Use --pos X,Y instead.")
+        return None
+    mons = get_monitors()
+    print(f"Detected {len(mons)} monitor(s):")
+    for i, m in enumerate(mons, 1):
+        prim = " [primary]" if getattr(m, "is_primary", False) else ""
+        print(f"  --monitor {i}:  {m.width}x{m.height}  origin ({m.x},{m.y}){prim}")
+    return mons
+
+
+def test_monitor_placement(monitor, pos, fullscreen):
+    """
+    Dry-run for two-monitor frequency-tagging: enumerate the monitors and, if a
+    target is given, pop a labelled test card on it so you can confirm each
+    subject's clip will land on the right screen -- WITHOUT starting a recording
+    or playing a clip. Run this once before a real session.
+    """
+    list_monitors()
+    origin = resolve_monitor_origin(monitor, pos)
+    if origin is None:
+        if monitor is None and pos is None:
+            print("\nNo --monitor/--pos given, so nothing to place. Re-run e.g. "
+                  "'--test-monitors --monitor 2 --fullscreen' to check a target screen.")
+        else:
+            print("\nCouldn't resolve that target (see warning above) -- no test card shown.")
+        return
+    win = "MonitorTest"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    if origin is not None:
+        cv2.moveWindow(win, origin[0], origin[1])
+    if fullscreen:
+        cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    else:
+        cv2.resizeWindow(win, 800, 600)
+    where = f"monitor {monitor}" if monitor is not None else f"pos {pos}"
+    card = text_frame((600, 800, 3), [
+        f"TEST CARD -- {where}",
+        f"origin = {origin}",
+        "Right screen for this subject?",
+        "Press any key to close.",
+    ])
+    cv2.imshow(win, card)
+    print(f"\nShowing a test card on {where} (origin={origin}). "
+          "Press any key in the window to close.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def play(video_path, marker_name, countdown_s, fullscreen, monitor=None, pos=None):
     if not os.path.exists(video_path):
         print(f"ERROR: file not found: {video_path}")
         sys.exit(1)
@@ -110,6 +214,13 @@ def play(video_path, marker_name, countdown_s, fullscreen):
 
     win = "Stimulus"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    # Move the window onto the target monitor BEFORE going fullscreen -- if you
+    # fullscreen first and move after, OpenCV tends to snap back to the primary
+    # display, which breaks two-monitor frequency-tagging (each subject's clip
+    # must fill its own screen).
+    origin = resolve_monitor_origin(monitor, pos)
+    if origin is not None:
+        cv2.moveWindow(win, origin[0], origin[1])
     if fullscreen:
         cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     else:
@@ -211,15 +322,35 @@ def main():
     p = argparse.ArgumentParser(
         description="Play a stimulus video and send an LSL marker at playback start."
     )
-    p.add_argument("video", help="path to the video file (mp4, avi, …)")
+    p.add_argument("video", nargs="?", default=None,
+                   help="path to the video file (mp4, avi, …); optional with --test-monitors")
     p.add_argument("--countdown", type=int, default=3,
                    help="countdown seconds before playback (default 3)")
     p.add_argument("--marker", default="stimulus_start",
                    help="LSL marker string (default 'stimulus_start')")
     p.add_argument("--fullscreen", action="store_true",
                    help="play video fullscreen")
+    p.add_argument("--monitor", type=int, default=None,
+                   help="which monitor to show the clip on (1-indexed), for "
+                        "two-monitor frequency-tagging. Needs the 'screeninfo' "
+                        "package (pip install screeninfo). Combine with --fullscreen.")
+    p.add_argument("--pos", default=None,
+                   help="explicit window top-left 'X,Y' pixel (e.g. '1920,0' for a "
+                        "second monitor to the right); overrides --monitor and needs "
+                        "no extra package. Combine with --fullscreen.")
+    p.add_argument("--test-monitors", action="store_true",
+                   help="dry-run: list monitors and (with --monitor/--pos) pop a test "
+                        "card on the target screen to confirm placement. No recording "
+                        "or video needed -- run before a real frequency-tagging session.")
     args = p.parse_args()
-    play(args.video, args.marker, args.countdown, args.fullscreen)
+
+    if args.test_monitors:
+        test_monitor_placement(args.monitor, args.pos, args.fullscreen)
+        return
+    if args.video is None:
+        p.error("a video path is required (unless using --test-monitors)")
+    play(args.video, args.marker, args.countdown, args.fullscreen,
+         monitor=args.monitor, pos=args.pos)
 
 
 if __name__ == "__main__":
